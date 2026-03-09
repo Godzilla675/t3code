@@ -902,6 +902,7 @@ describe("ProviderRuntimeIngestion", () => {
       payload: {
         itemType: "assistant_message",
         status: "completed",
+        detail: "hello live",
       },
     });
 

@@ -5,7 +5,7 @@ import {
   type OrchestrationEvent,
   type ProviderModelOptions,
   type ProviderKind,
-  type ProviderServiceTier,
+  type ProviderStartOptions,
   type OrchestrationSession,
   ThreadId,
   type ProviderSession,
@@ -151,6 +151,8 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const threadProviderOptions = new Map<string, ProviderStartOptions>();
+
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
     readonly kind:
@@ -210,7 +212,7 @@ const make = Effect.gen(function* () {
       readonly providerOptions?: ProviderStartOptions;
       readonly model?: string;
       readonly modelOptions?: ProviderModelOptions;
-      readonly serviceTier?: ProviderServiceTier | null;
+      readonly providerOptions?: ProviderStartOptions;
     },
   ) {
     const readModel = yield* orchestrationEngine.getReadModel();
@@ -250,8 +252,8 @@ const make = Effect.gen(function* () {
         ...(providerOptions !== undefined ? { providerOptions } : {}),
         ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
         ...(desiredModel ? { model: desiredModel } : {}),
-        ...(options?.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
         ...(options?.modelOptions !== undefined ? { modelOptions: options.modelOptions } : {}),
+        ...(options?.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
         runtimeMode: desiredRuntimeMode,
       });
@@ -369,8 +371,8 @@ const make = Effect.gen(function* () {
     readonly provider?: ProviderKind;
     readonly providerOptions?: ProviderStartOptions;
     readonly model?: string;
-    readonly serviceTier?: ProviderServiceTier | null;
     readonly modelOptions?: ProviderModelOptions;
+    readonly providerOptions?: ProviderStartOptions;
     readonly interactionMode?: "default" | "plan";
     readonly createdAt: string;
   }) {
@@ -378,12 +380,15 @@ const make = Effect.gen(function* () {
     if (!thread) {
       return;
     }
+    if (input.providerOptions !== undefined) {
+      threadProviderOptions.set(input.threadId, input.providerOptions);
+    }
     yield* ensureSessionForThread(input.threadId, input.createdAt, {
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
-      ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
       ...(input.modelOptions !== undefined ? { modelOptions: input.modelOptions } : {}),
+      ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
     });
     const normalizedInput = toNonEmptyProviderInput(input.messageText);
     const normalizedAttachments = input.attachments ?? [];
@@ -402,7 +407,6 @@ const make = Effect.gen(function* () {
       ...(normalizedInput ? { input: normalizedInput } : {}),
       ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
       ...(modelForTurn !== undefined ? { model: modelForTurn } : {}),
-      ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
       ...(input.modelOptions !== undefined ? { modelOptions: input.modelOptions } : {}),
       ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
     });
@@ -520,8 +524,8 @@ const make = Effect.gen(function* () {
         ? { providerOptions: event.payload.providerOptions }
         : {}),
       ...(event.payload.model !== undefined ? { model: event.payload.model } : {}),
-      ...(event.payload.serviceTier !== undefined ? { serviceTier: event.payload.serviceTier } : {}),
       ...(event.payload.modelOptions !== undefined ? { modelOptions: event.payload.modelOptions } : {}),
+      ...(event.payload.providerOptions !== undefined ? { providerOptions: event.payload.providerOptions } : {}),
       interactionMode: event.payload.interactionMode,
       createdAt: event.payload.createdAt,
     });
@@ -677,7 +681,14 @@ const make = Effect.gen(function* () {
           if (!thread?.session || thread.session.status === "stopped") {
             return;
           }
-          yield* ensureSessionForThread(event.payload.threadId, event.occurredAt);
+          const cachedProviderOptions = threadProviderOptions.get(event.payload.threadId);
+          yield* ensureSessionForThread(
+            event.payload.threadId,
+            event.occurredAt,
+            cachedProviderOptions !== undefined
+              ? { providerOptions: cachedProviderOptions }
+              : undefined,
+          );
           return;
         }
         case "thread.turn-start-requested":

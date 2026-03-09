@@ -1347,12 +1347,7 @@ describe("WebSocket Server", () => {
     };
     terminalManager.emitEvent(manualEvent);
 
-    const push = await waitForPushMatching(
-      ws,
-      (message) => message.channel === WS_CHANNELS.terminalEvent,
-    );
-    expect(push.type).toBe("push");
-    expect(push.channel).toBe(WS_CHANNELS.terminalEvent);
+    const push = await waitForPush(ws, WS_CHANNELS.terminalEvent);
     expect((push.data as TerminalEvent).type).toBe("output");
   });
 

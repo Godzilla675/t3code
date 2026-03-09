@@ -623,6 +623,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
     }) =>
       Effect.gen(function* () {
         const adapter = yield* registry.getByProvider(input.binding.provider);
+        const persistedProviderOptions = readPersistedProviderStartOptions(input.binding.runtimePayload);
         const hasResumeCursor =
           input.binding.resumeCursor !== null && input.binding.resumeCursor !== undefined;
         const hasActiveSession = yield* adapter.hasSession(input.binding.threadId);
@@ -630,7 +631,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           const activeSessions = yield* adapter.listSessions();
           const existing = activeSessions.find((session) => session.threadId === input.binding.threadId);
           if (existing) {
-            yield* upsertSessionBinding(existing, input.binding.threadId);
+            yield* upsertSessionBinding(
+              existing,
+              input.binding.threadId,
+              persistedProviderOptions ? { providerOptions: persistedProviderOptions } : undefined,
+            );
             yield* analytics.record("provider.session.recovered", {
               provider: existing.provider,
               strategy: "adopt-existing",
@@ -655,7 +660,6 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
         const persistedModel = readPersistedModel(input.binding.runtimePayload);
         const persistedActiveTurnId = readPersistedActiveTurnId(input.binding.runtimePayload);
-        const persistedProviderOptions = readPersistedProviderStartOptions(input.binding.runtimePayload);
 
         const resumed = yield* adapter.startSession({
           threadId: input.binding.threadId,
@@ -674,7 +678,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           );
         }
 
-        yield* upsertSessionBinding(resumed, input.binding.threadId);
+        yield* upsertSessionBinding(
+          resumed,
+          input.binding.threadId,
+          persistedProviderOptions ? { providerOptions: persistedProviderOptions } : undefined,
+        );
         yield* analytics.record("provider.session.recovered", {
           provider: resumed.provider,
           strategy: "resume-thread",

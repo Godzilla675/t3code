@@ -5,7 +5,7 @@ import {
   TurnId,
   type OrchestrationReadModel,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { markThreadUnread, syncServerReadModel, type AppState } from "./store";
 import { DEFAULT_INTERACTION_MODE, DEFAULT_RUNTIME_MODE, type Thread } from "./types";
@@ -73,7 +73,10 @@ function makeReadModelThread(overrides: Partial<OrchestrationReadModel["threads"
   } satisfies OrchestrationReadModel["threads"][number];
 }
 
-function makeReadModel(thread: OrchestrationReadModel["threads"][number]): OrchestrationReadModel {
+function makeReadModel(
+  thread: OrchestrationReadModel["threads"][number],
+  projectOverrides: Partial<OrchestrationReadModel["projects"][number]> = {},
+): OrchestrationReadModel {
   return {
     snapshotSequence: 1,
     updatedAt: "2026-02-27T00:00:00.000Z",
@@ -87,11 +90,66 @@ function makeReadModel(thread: OrchestrationReadModel["threads"][number]): Orche
         updatedAt: "2026-02-27T00:00:00.000Z",
         deletedAt: null,
         scripts: [],
+        ...projectOverrides,
       },
     ],
     threads: [thread],
   };
 }
+
+class MemoryStorage implements Storage {
+  private readonly entries = new Map<string, string>();
+
+  get length(): number {
+    return this.entries.size;
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  getItem(key: string): string | null {
+    return this.entries.get(key) ?? null;
+  }
+
+  key(index: number): string | null {
+    return [...this.entries.keys()][index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    this.entries.delete(key);
+  }
+
+  setItem(key: string, value: string): void {
+    this.entries.set(key, value);
+  }
+}
+
+const mockLocalStorage = new MemoryStorage();
+const originalWindow = globalThis.window;
+
+beforeEach(() => {
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      localStorage: mockLocalStorage,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    },
+  });
+  window.localStorage.clear();
+});
+
+afterAll(() => {
+  if (originalWindow === undefined) {
+    Reflect.deleteProperty(globalThis, "window");
+    return;
+  }
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: originalWindow,
+  });
+});
 
 describe("store pure functions", () => {
   it("markThreadUnread moves lastVisitedAt before completion for a completed thread", () => {
@@ -146,5 +204,68 @@ describe("store read model sync", () => {
     const next = syncServerReadModel(initialState, readModel);
 
     expect(next.threads[0]?.model).toBe(DEFAULT_MODEL_BY_PROVIDER.codex);
+  });
+
+  it("preserves Copilot session provider and model during hydration", () => {
+    const initialState = makeState(makeThread());
+    const readModel = makeReadModel(
+      makeReadModelThread({
+        model: "gpt-5",
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "running",
+          providerName: "copilot",
+          runtimeMode: DEFAULT_RUNTIME_MODE,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-02-27T00:00:00.000Z",
+        },
+      }),
+    );
+
+    const next = syncServerReadModel(initialState, readModel);
+
+    expect(next.threads[0]?.model).toBe(DEFAULT_MODEL_BY_PROVIDER.copilot);
+    expect(next.threads[0]?.session?.provider).toBe("copilot");
+  });
+
+  it("infers Copilot project defaults from Copilot model slugs", () => {
+    const initialState: AppState = {
+      projects: [],
+      threads: [],
+      threadsHydrated: false,
+    };
+    const readModel = makeReadModel(
+      makeReadModelThread({
+        model: "gpt-5",
+      }),
+      {
+        defaultModel: "gpt-5",
+      },
+    );
+
+    const next = syncServerReadModel(initialState, readModel);
+
+    expect(next.projects[0]?.model).toBe(DEFAULT_MODEL_BY_PROVIDER.copilot);
+    expect(next.threads[0]?.model).toBe(DEFAULT_MODEL_BY_PROVIDER.copilot);
+  });
+
+  it("preserves saved custom Copilot models during hydration", () => {
+    window.localStorage.setItem(
+      "t3code:app-settings:v1",
+      JSON.stringify({
+        customCopilotModels: ["custom/copilot-model"],
+      }),
+    );
+    const initialState = makeState(makeThread());
+    const readModel = makeReadModel(
+      makeReadModelThread({
+        model: "custom/copilot-model",
+      }),
+    );
+
+    const next = syncServerReadModel(initialState, readModel);
+
+    expect(next.threads[0]?.model).toBe("custom/copilot-model");
   });
 });

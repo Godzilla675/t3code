@@ -1,6 +1,10 @@
 import { useCallback, useSyncExternalStore } from "react";
 import { Option, Schema } from "effect";
-import { type ProviderKind, type ProviderServiceTier } from "@t3tools/contracts";
+import {
+  type ProviderKind,
+  type ProviderServiceTier,
+  type ProviderStartOptions,
+} from "@t3tools/contracts";
 import { getDefaultModel, getModelOptions, normalizeModelSlug } from "@t3tools/shared/model";
 
 const APP_SETTINGS_STORAGE_KEY = "t3code:app-settings:v1";
@@ -28,6 +32,7 @@ const AppServiceTierSchema = Schema.Literals(["auto", "fast", "flex"]);
 const MODELS_WITH_FAST_SUPPORT = new Set(["gpt-5.4"]);
 const BUILT_IN_MODEL_SLUGS_BY_PROVIDER: Record<ProviderKind, ReadonlySet<string>> = {
   codex: new Set(getModelOptions("codex").map((option) => option.slug)),
+  copilot: new Set(getModelOptions("copilot").map((option) => option.slug)),
 };
 
 const AppSettingsSchema = Schema.Struct({
@@ -35,6 +40,12 @@ const AppSettingsSchema = Schema.Struct({
     Schema.withConstructorDefault(() => Option.some("")),
   ),
   codexHomePath: Schema.String.check(Schema.isMaxLength(4096)).pipe(
+    Schema.withConstructorDefault(() => Option.some("")),
+  ),
+  copilotCliUrl: Schema.String.check(Schema.isMaxLength(4096)).pipe(
+    Schema.withConstructorDefault(() => Option.some("")),
+  ),
+  copilotConfigDir: Schema.String.check(Schema.isMaxLength(4096)).pipe(
     Schema.withConstructorDefault(() => Option.some("")),
   ),
   confirmThreadDelete: Schema.Boolean.pipe(Schema.withConstructorDefault(() => Option.some(true))),
@@ -45,12 +56,25 @@ const AppSettingsSchema = Schema.Struct({
   customCodexModels: Schema.Array(Schema.String).pipe(
     Schema.withConstructorDefault(() => Option.some([])),
   ),
+  customCopilotModels: Schema.Array(Schema.String).pipe(
+    Schema.withConstructorDefault(() => Option.some([])),
+  ),
 });
 export type AppSettings = typeof AppSettingsSchema.Type;
+export type AppProviderModelSettings = Pick<AppSettings, "customCodexModels" | "customCopilotModels">;
+export type AppProviderRuntimeSettings = Pick<
+  AppSettings,
+  "codexBinaryPath" | "codexHomePath" | "copilotCliUrl" | "copilotConfigDir"
+>;
 export interface AppModelOption {
   slug: string;
   name: string;
   isCustom: boolean;
+}
+
+function normalizeOptionalProviderSetting(value: string): string | undefined {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 export function resolveAppServiceTier(serviceTier: AppServiceTier): ProviderServiceTier | null {
@@ -108,7 +132,88 @@ function normalizeAppSettings(settings: AppSettings): AppSettings {
   return {
     ...settings,
     customCodexModels: normalizeCustomModelSlugs(settings.customCodexModels, "codex"),
+    customCopilotModels: normalizeCustomModelSlugs(settings.customCopilotModels, "copilot"),
   };
+}
+
+export function getCustomModelsForProvider(
+  settings: AppProviderModelSettings,
+  provider: ProviderKind,
+): readonly string[] {
+  switch (provider) {
+    case "copilot":
+      return settings.customCopilotModels;
+    case "codex":
+    default:
+      return settings.customCodexModels;
+  }
+}
+
+export function patchCustomModelsForProvider(
+  provider: ProviderKind,
+  models: string[],
+): Partial<AppSettings> {
+  switch (provider) {
+    case "copilot":
+      return { customCopilotModels: models };
+    case "codex":
+    default:
+      return { customCodexModels: models };
+  }
+}
+
+export function getProviderStartOptions(
+  settings: AppProviderRuntimeSettings,
+  provider: ProviderKind,
+): ProviderStartOptions {
+  switch (provider) {
+    case "copilot": {
+      const cliUrl = normalizeOptionalProviderSetting(settings.copilotCliUrl);
+      const configDir = normalizeOptionalProviderSetting(settings.copilotConfigDir);
+      return {
+        copilot: {
+          ...(cliUrl ? { cliUrl } : {}),
+          ...(configDir ? { configDir } : {}),
+        },
+      };
+    }
+    case "codex":
+    default: {
+      const binaryPath = normalizeOptionalProviderSetting(settings.codexBinaryPath);
+      const homePath = normalizeOptionalProviderSetting(settings.codexHomePath);
+      return {
+        codex: {
+          ...(binaryPath ? { binaryPath } : {}),
+          ...(homePath ? { homePath } : {}),
+        },
+      };
+    }
+  }
+}
+
+export function inferProviderForAppModel(
+  settings: AppProviderModelSettings,
+  model: string | null | undefined,
+): ProviderKind {
+  const normalizedCopilot = normalizeModelSlug(model, "copilot");
+  if (
+    normalizedCopilot &&
+    (BUILT_IN_MODEL_SLUGS_BY_PROVIDER.copilot.has(normalizedCopilot) ||
+      getCustomModelsForProvider(settings, "copilot").includes(normalizedCopilot))
+  ) {
+    return "copilot";
+  }
+
+  const normalizedCodex = normalizeModelSlug(model, "codex");
+  if (
+    normalizedCodex &&
+    (BUILT_IN_MODEL_SLUGS_BY_PROVIDER.codex.has(normalizedCodex) ||
+      getCustomModelsForProvider(settings, "codex").includes(normalizedCodex))
+  ) {
+    return "codex";
+  }
+
+  return "codex";
 }
 
 export function getAppModelOptions(
@@ -211,7 +316,16 @@ function parsePersistedSettings(value: string | null): AppSettings {
   }
 
   try {
-    return normalizeAppSettings(Schema.decodeSync(Schema.fromJsonString(AppSettingsSchema))(value));
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return DEFAULT_APP_SETTINGS;
+    }
+    return normalizeAppSettings(
+      Schema.decodeSync(AppSettingsSchema)({
+        ...DEFAULT_APP_SETTINGS,
+        ...parsed,
+      }),
+    );
   } catch {
     return DEFAULT_APP_SETTINGS;
   }

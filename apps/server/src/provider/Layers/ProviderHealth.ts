@@ -13,9 +13,10 @@ import type {
   ServerProviderStatus,
   ServerProviderStatusState,
 } from "@t3tools/contracts";
-import { Effect, Layer, Option, Result, Stream } from "effect";
+import { Effect, Layer, Option, Result, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
+import { loadCopilotSdk } from "../copilotSdkCompat.ts";
 import {
   formatCodexCliUpgradeMessage,
   isCodexCliVersionSupported,
@@ -25,6 +26,7 @@ import { ProviderHealth, type ProviderHealthShape } from "../Services/ProviderHe
 
 const DEFAULT_TIMEOUT_MS = 4_000;
 const CODEX_PROVIDER = "codex" as const;
+const COPILOT_PROVIDER = "copilot" as const;
 
 // ── Pure helpers ────────────────────────────────────────────────────
 
@@ -40,6 +42,10 @@ function nonEmptyTrimmed(value: string | undefined): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function toError(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error(String(cause));
+}
+
 function isCommandMissingCause(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const lower = error.message.toLowerCase();
@@ -48,6 +54,18 @@ function isCommandMissingCause(error: unknown): boolean {
     lower.includes("spawn codex enoent") ||
     lower.includes("enoent") ||
     lower.includes("notfound")
+  );
+}
+
+function isCopilotUnavailableCause(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const lower = error.message.toLowerCase();
+  return (
+    lower.includes("enoent") ||
+    lower.includes("notfound") ||
+    lower.includes("not found") ||
+    lower.includes("failed to start") ||
+    lower.includes("unavailable")
   );
 }
 
@@ -82,6 +100,52 @@ function extractAuthBoolean(value: unknown): boolean | undefined {
   }
   for (const key of ["auth", "status", "session", "account"] as const) {
     const nested = extractAuthBoolean(record[key]);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+}
+
+function extractAuthStatusString(value: unknown): ServerProviderAuthStatus | undefined {
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const nested = extractAuthStatusString(entry);
+      if (nested !== undefined) return nested;
+    }
+    return undefined;
+  }
+
+  if (typeof value === "string") {
+    const lower = value.toLowerCase();
+    if (
+      lower.includes("unauthenticated") ||
+      lower.includes("not authenticated") ||
+      lower.includes("not logged in") ||
+      lower.includes("signed out") ||
+      lower.includes("signed_out") ||
+      lower.includes("logged_out") ||
+      lower.includes("login required")
+    ) {
+      return "unauthenticated";
+    }
+    if (
+      lower.includes("authenticated") ||
+      lower.includes("logged in") ||
+      lower.includes("signed in")
+    ) {
+      return "authenticated";
+    }
+    return undefined;
+  }
+
+  if (!value || typeof value !== "object") return undefined;
+
+  const record = value as Record<string, unknown>;
+  for (const key of ["authStatus", "status", "state"] as const) {
+    const nested = extractAuthStatusString(record[key]);
+    if (nested !== undefined) return nested;
+  }
+  for (const key of ["auth", "session", "account", "user"] as const) {
+    const nested = extractAuthStatusString(record[key]);
     if (nested !== undefined) return nested;
   }
   return undefined;
@@ -166,6 +230,175 @@ export function parseAuthStatusFromOutput(result: CommandResult): {
       : "Could not verify Codex authentication status.",
   };
 }
+
+export function parseCopilotAuthStatus(authStatus: unknown): {
+  readonly status: ServerProviderStatusState;
+  readonly authStatus: ServerProviderAuthStatus;
+  readonly message?: string;
+} {
+  const booleanAuth = extractAuthBoolean(authStatus);
+  const stringAuth = extractAuthStatusString(authStatus);
+  const resolvedAuth =
+    booleanAuth === true
+      ? "authenticated"
+      : booleanAuth === false
+        ? "unauthenticated"
+        : stringAuth;
+
+  if (resolvedAuth === "authenticated") {
+    return { status: "ready", authStatus: "authenticated" };
+  }
+
+  if (resolvedAuth === "unauthenticated") {
+    return {
+      status: "error",
+      authStatus: "unauthenticated",
+      message: "GitHub Copilot is not authenticated. Sign in to Copilot and restart T3 Code.",
+    };
+  }
+
+  return {
+    status: "warning",
+    authStatus: "unknown",
+    message: "Could not verify GitHub Copilot authentication status.",
+  };
+}
+
+export interface CopilotHealthClient {
+  readonly start: () => Promise<unknown>;
+  readonly stop: () => Promise<unknown>;
+  readonly getAuthStatus: () => Promise<unknown>;
+}
+
+const makeCopilotHealthClient = async (): Promise<CopilotHealthClient> => {
+  const sdk = await loadCopilotSdk();
+  return new sdk.CopilotClient({ autoStart: false });
+};
+
+class CopilotHealthProbeError extends Schema.TaggedErrorClass<CopilotHealthProbeError>()(
+  "CopilotHealthProbeError",
+  {
+    operation: Schema.String,
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+const toCopilotHealthProbeError = (
+  operation: string,
+  detail: string,
+  cause?: unknown,
+): CopilotHealthProbeError =>
+  new CopilotHealthProbeError({
+    operation,
+    detail,
+    ...(cause !== undefined ? { cause } : {}),
+  });
+
+const stopCopilotHealthClient = (client: CopilotHealthClient): Effect.Effect<void> =>
+  Effect.tryPromise({
+    try: () => client.stop().then(() => undefined),
+    catch: (cause) =>
+      toCopilotHealthProbeError(
+        "stop",
+        `Failed to stop GitHub Copilot health probe client: ${
+          cause instanceof Error ? cause.message : String(cause)
+        }.`,
+        cause,
+      ),
+  }).pipe(Effect.catchTag("CopilotHealthProbeError", (error) => Effect.logWarning(error.message)));
+
+const probeCopilotHealthClient = (
+  client: CopilotHealthClient,
+  checkedAt: string,
+): Effect.Effect<ServerProviderStatus> =>
+  Effect.gen(function* () {
+    const startProbe = yield* Effect.tryPromise({
+      try: () => client.start(),
+      catch: (cause) =>
+        toCopilotHealthProbeError(
+          "start",
+          `Failed to start GitHub Copilot health check: ${toError(cause).message}.`,
+          cause,
+        ),
+    }).pipe(Effect.timeoutOption(DEFAULT_TIMEOUT_MS), Effect.result);
+
+    if (Result.isFailure(startProbe)) {
+      const error = startProbe.failure;
+      return {
+        provider: COPILOT_PROVIDER,
+        status: "error" as const,
+        available: false,
+        authStatus: "unknown" as const,
+        checkedAt,
+        message: isCopilotUnavailableCause(error)
+          ? "GitHub Copilot is unavailable. Install or repair the Copilot CLI backend and restart T3 Code."
+          : `Failed to start GitHub Copilot health check: ${
+              error instanceof Error ? error.message : String(error)
+            }.`,
+      };
+    }
+
+    if (Option.isNone(startProbe.success)) {
+      return {
+        provider: COPILOT_PROVIDER,
+        status: "error" as const,
+        available: false,
+        authStatus: "unknown" as const,
+        checkedAt,
+        message: "GitHub Copilot health check timed out while starting the client.",
+      };
+    }
+
+    const authProbe = yield* Effect.tryPromise({
+      try: () => client.getAuthStatus(),
+      catch: (cause) =>
+        toCopilotHealthProbeError(
+          "auth",
+          `Could not verify GitHub Copilot authentication status: ${toError(cause).message}.`,
+          cause,
+        ),
+    }).pipe(Effect.timeoutOption(DEFAULT_TIMEOUT_MS), Effect.result);
+
+    if (Result.isFailure(authProbe)) {
+      const error = authProbe.failure;
+      return {
+        provider: COPILOT_PROVIDER,
+        status: "warning" as const,
+        available: true,
+        authStatus: "unknown" as const,
+        checkedAt,
+        message: `Could not verify GitHub Copilot authentication status: ${
+          error instanceof Error ? error.message : String(error)
+        }.`,
+      };
+    }
+
+    if (Option.isNone(authProbe.success)) {
+      return {
+        provider: COPILOT_PROVIDER,
+        status: "warning" as const,
+        available: true,
+        authStatus: "unknown" as const,
+        checkedAt,
+        message: "Could not verify GitHub Copilot authentication status. Timed out while querying Copilot.",
+      };
+    }
+
+    const parsed = parseCopilotAuthStatus(authProbe.success.value);
+    return {
+      provider: COPILOT_PROVIDER,
+      status: parsed.status,
+      available: true,
+      authStatus: parsed.authStatus,
+      checkedAt,
+      ...(parsed.message ? { message: parsed.message } : {}),
+    } satisfies ServerProviderStatus;
+  });
 
 // ── Effect-native command execution ─────────────────────────────────
 
@@ -307,14 +540,46 @@ export const checkCodexProviderStatus: Effect.Effect<
   } satisfies ServerProviderStatus;
 });
 
+export const checkCopilotProviderStatus = (options?: {
+  readonly clientFactory?: () => CopilotHealthClient | Promise<CopilotHealthClient>;
+}): Effect.Effect<ServerProviderStatus> =>
+  Effect.tryPromise({
+    try: () => Promise.resolve((options?.clientFactory ?? makeCopilotHealthClient)()),
+    catch: (cause) =>
+      toCopilotHealthProbeError(
+        "init",
+        `Failed to initialize GitHub Copilot health check: ${toError(cause).message}.`,
+        cause,
+      ),
+  }).pipe(
+    Effect.flatMap((client) =>
+      Effect.acquireUseRelease(
+        Effect.succeed(client),
+        (readyClient) => probeCopilotHealthClient(readyClient, new Date().toISOString()),
+        stopCopilotHealthClient,
+      ),
+    ),
+    Effect.catchTag("CopilotHealthProbeError", (error) =>
+      Effect.succeed({
+        provider: COPILOT_PROVIDER,
+        status: "error" as const,
+        available: false,
+        authStatus: "unknown" as const,
+        checkedAt: new Date().toISOString(),
+        message: `Failed to initialize GitHub Copilot health check: ${error.message}.`,
+      } satisfies ServerProviderStatus),
+    ),
+  );
+
 // ── Layer ───────────────────────────────────────────────────────────
 
 export const ProviderHealthLive = Layer.effect(
   ProviderHealth,
   Effect.gen(function* () {
     const codexStatus = yield* checkCodexProviderStatus;
+    const copilotStatus = yield* checkCopilotProviderStatus();
     return {
-      getStatuses: Effect.succeed([codexStatus]),
+      getStatuses: Effect.succeed([codexStatus, copilotStatus]),
     } satisfies ProviderHealthShape;
   }),
 );

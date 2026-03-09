@@ -14,7 +14,7 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import { Effect, Exit, Layer, ManagedRuntime, PubSub, Scope, Stream } from "effect";
+import { Effect, Exit, Layer, ManagedRuntime, Option, PubSub, Scope, Stream } from "effect";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
@@ -24,6 +24,7 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { ProviderRuntimeIngestionLive } from "./ProviderRuntimeIngestion.ts";
@@ -57,6 +58,7 @@ type LegacyProviderRuntimeEvent = {
 
 function createProviderServiceHarness() {
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  let bindingProvider: "codex" | "copilot" = "codex";
 
   const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
   const service: ProviderServiceShape = {
@@ -66,19 +68,41 @@ function createProviderServiceHarness() {
     respondToRequest: () => unsupported(),
     respondToUserInput: () => unsupported(),
     stopSession: () => unsupported(),
+    stopSessionForProvider: () => unsupported(),
     listSessions: () => Effect.succeed([]),
     getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+    reconcilePersistedSessions: () => Effect.void,
     rollbackConversation: () => unsupported(),
     streamEvents: Stream.fromPubSub(runtimeEventPubSub),
   };
+  const directoryService: typeof ProviderSessionDirectory.Service = {
+    upsert: (binding) =>
+      Effect.sync(() => {
+        bindingProvider = binding.provider;
+      }),
+    getProvider: (_threadId) => Effect.succeed(bindingProvider),
+    getBinding: (threadId) =>
+      Effect.succeed(
+        Option.some({
+          threadId,
+          provider: bindingProvider,
+        }),
+      ),
+    remove: (_threadId) => Effect.void,
+    listThreadIds: () => Effect.succeed([asThreadId("thread-1")]),
+  };
 
-  const emit = (event: LegacyProviderRuntimeEvent): void => {
+  const emit = (event: LegacyProviderRuntimeEvent | ProviderRuntimeEvent): void => {
     Effect.runSync(PubSub.publish(runtimeEventPubSub, event as unknown as ProviderRuntimeEvent));
   };
 
   return {
     service,
+    directoryService,
     emit,
+    setBindingProvider: (provider: "codex" | "copilot") => {
+      bindingProvider = provider;
+    },
   };
 }
 
@@ -151,6 +175,7 @@ describe("ProviderRuntimeIngestion", () => {
     const layer = ProviderRuntimeIngestionLive.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
+      Layer.provideMerge(Layer.succeed(ProviderSessionDirectory, provider.directoryService)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
       Layer.provideMerge(NodeServices.layer),
     );
@@ -209,6 +234,7 @@ describe("ProviderRuntimeIngestion", () => {
     return {
       engine,
       emit: provider.emit,
+      setBindingProvider: provider.setBindingProvider,
     };
   }
 
@@ -252,6 +278,48 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+  });
+
+  it("ignores stale runtime lifecycle events from a provider that no longer owns the thread", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    harness.setBindingProvider("copilot");
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-session-seed-copilot"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "ready",
+          providerName: "copilot",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          updatedAt: now,
+          lastError: null,
+        },
+        createdAt: now,
+      }),
+    );
+
+    harness.emit({
+      type: "session.exited",
+      eventId: asEventId("evt-stale-session-exited"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      payload: {
+        reason: "stale session",
+        exitKind: "graceful",
+      },
+    });
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    const readModel = await Effect.runPromise(harness.engine.getReadModel());
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.makeUnsafe("thread-1"));
+    expect(thread?.session?.providerName).toBe("copilot");
+    expect(thread?.session?.status).toBe("ready");
   });
 
   it("applies provider session.state.changed transitions directly", async () => {

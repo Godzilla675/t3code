@@ -1,11 +1,25 @@
 import { describe, expect, it } from "vitest";
 import { Schema } from "effect";
 
-import { ProviderRuntimeEvent } from "./providerRuntime";
+import { ProviderRuntimeEvent, RuntimeEventRaw } from "./providerRuntime";
 
 const decodeRuntimeEvent = Schema.decodeUnknownSync(ProviderRuntimeEvent);
+const decodeRuntimeEventRaw = Schema.decodeUnknownSync(RuntimeEventRaw);
 
 describe("ProviderRuntimeEvent", () => {
+  it("accepts copilot raw event metadata", () => {
+    const parsed = decodeRuntimeEventRaw({
+      source: "copilot.sdk.event",
+      method: "assistant.message_delta",
+      payload: {
+        delta: "Hello from Copilot",
+      },
+    });
+
+    expect(parsed.source).toBe("copilot.sdk.event");
+    expect(parsed.method).toBe("assistant.message_delta");
+  });
+
   it("decodes turn.plan.updated for plan rendering", () => {
     const parsed = decodeRuntimeEvent({
       type: "turn.plan.updated",

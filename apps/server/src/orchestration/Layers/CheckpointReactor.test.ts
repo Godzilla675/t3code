@@ -88,8 +88,10 @@ function createProviderServiceHarness(
     respondToRequest: () => unsupported(),
     respondToUserInput: () => unsupported(),
     stopSession: () => unsupported(),
+    stopSessionForProvider: () => unsupported(),
     listSessions,
     getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+    reconcilePersistedSessions: () => Effect.void,
     rollbackConversation,
     streamEvents: Stream.fromPubSub(runtimeEventPubSub),
   };

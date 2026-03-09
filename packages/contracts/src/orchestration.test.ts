@@ -186,6 +186,60 @@ it.effect("accepts provider-scoped model options in thread.turn.start", () =>
   }),
 );
 
+it.effect("accepts copilot provider selections in thread.turn.start", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeThreadTurnStartCommand({
+      type: "thread.turn.start",
+      commandId: "cmd-turn-copilot",
+      threadId: "thread-1",
+      message: {
+        messageId: "msg-copilot",
+        role: "user",
+        text: "hello",
+        attachments: [],
+      },
+      provider: "copilot",
+      model: "gpt-5",
+      modelOptions: {
+        copilot: {},
+      },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(parsed.provider, "copilot");
+    assert.deepStrictEqual(parsed.modelOptions?.copilot, {});
+  }),
+);
+
+it.effect("accepts provider runtime options in thread.turn.start", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeThreadTurnStartCommand({
+      type: "thread.turn.start",
+      commandId: "cmd-turn-provider-options",
+      threadId: "thread-1",
+      message: {
+        messageId: "msg-provider-options",
+        role: "user",
+        text: "hello",
+        attachments: [],
+      },
+      provider: "copilot",
+      providerOptions: {
+        copilot: {
+          cliUrl: "http://127.0.0.1:8123",
+          configDir: "/tmp/copilot-config",
+        },
+      },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.deepStrictEqual(parsed.providerOptions, {
+      copilot: {
+        cliUrl: "http://127.0.0.1:8123",
+        configDir: "/tmp/copilot-config",
+      },
+    });
+  }),
+);
+
 it.effect(
   "decodes thread.turn-start-requested defaults for provider, runtime mode, and interaction mode",
   () =>
@@ -199,6 +253,29 @@ it.effect(
       assert.strictEqual(parsed.runtimeMode, DEFAULT_RUNTIME_MODE);
       assert.strictEqual(parsed.interactionMode, DEFAULT_PROVIDER_INTERACTION_MODE);
     }),
+);
+
+it.effect("accepts provider runtime options in thread.turn-start-requested payloads", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeThreadTurnStartRequestedPayload({
+      threadId: "thread-1",
+      messageId: "msg-1",
+      provider: "copilot",
+      providerOptions: {
+        copilot: {
+          cliUrl: "http://127.0.0.1:8123",
+          configDir: "/tmp/copilot-config",
+        },
+      },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.deepStrictEqual(parsed.providerOptions, {
+      copilot: {
+        cliUrl: "http://127.0.0.1:8123",
+        configDir: "/tmp/copilot-config",
+      },
+    });
+  }),
 );
 
 it.effect("decodes orchestration session runtime mode defaults", () =>

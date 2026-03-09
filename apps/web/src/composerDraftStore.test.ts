@@ -399,6 +399,14 @@ describe("composerDraftStore setProvider", () => {
     expect(useComposerDraftStore.getState().draftsByThreadId[threadId]?.provider).toBe("codex");
   });
 
+  it("accepts Copilot as a persisted provider selection", () => {
+    const store = useComposerDraftStore.getState();
+
+    store.setProvider(threadId, "copilot");
+
+    expect(useComposerDraftStore.getState().draftsByThreadId[threadId]?.provider).toBe("copilot");
+  });
+
   it("removes empty provider-only draft when provider is reset", () => {
     const store = useComposerDraftStore.getState();
 

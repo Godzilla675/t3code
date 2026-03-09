@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  getProviderStartOptions,
   getAppModelOptions,
   getSlashModelOptions,
+  inferProviderForAppModel,
   normalizeCustomModelSlugs,
   resolveAppServiceTier,
   shouldShowFastTierIcon,
@@ -21,6 +23,12 @@ describe("normalizeCustomModelSlugs", () => {
         null,
       ]),
     ).toEqual(["custom/internal-model"]);
+  });
+
+  it("filters built-in Copilot models from custom entries", () => {
+    expect(normalizeCustomModelSlugs([" gpt-5 ", "custom/copilot-model"], "copilot")).toEqual([
+      "custom/copilot-model",
+    ]);
   });
 });
 
@@ -47,6 +55,12 @@ describe("getAppModelOptions", () => {
       isCustom: true,
     });
   });
+
+  it("returns Copilot built-ins before custom Copilot models", () => {
+    const options = getAppModelOptions("copilot", ["custom/copilot-model"]);
+
+    expect(options.map((option) => option.slug)).toEqual(["gpt-5", "custom/copilot-model"]);
+  });
 });
 
 describe("resolveAppModelSelection", () => {
@@ -58,6 +72,73 @@ describe("resolveAppModelSelection", () => {
 
   it("falls back to the provider default when no model is selected", () => {
     expect(resolveAppModelSelection("codex", [], "")).toBe("gpt-5.4");
+    expect(resolveAppModelSelection("copilot", [], "")).toBe("gpt-5");
+  });
+});
+
+describe("inferProviderForAppModel", () => {
+  it("recognizes built-in provider models", () => {
+    expect(
+      inferProviderForAppModel(
+        { customCodexModels: [], customCopilotModels: [] },
+        "gpt-5",
+      ),
+    ).toBe("copilot");
+    expect(
+      inferProviderForAppModel(
+        { customCodexModels: [], customCopilotModels: [] },
+        "gpt-5.4",
+      ),
+    ).toBe("codex");
+  });
+
+  it("recognizes saved custom Copilot models", () => {
+    expect(
+      inferProviderForAppModel(
+        { customCodexModels: [], customCopilotModels: ["custom/copilot-model"] },
+        "custom/copilot-model",
+      ),
+    ).toBe("copilot");
+  });
+});
+
+describe("getProviderStartOptions", () => {
+  it("maps Codex runtime overrides into provider start options", () => {
+    expect(
+      getProviderStartOptions(
+        {
+          codexBinaryPath: " /usr/local/bin/codex ",
+          codexHomePath: " /tmp/codex-home ",
+          copilotCliUrl: "",
+          copilotConfigDir: "",
+        },
+        "codex",
+      ),
+    ).toEqual({
+      codex: {
+        binaryPath: "/usr/local/bin/codex",
+        homePath: "/tmp/codex-home",
+      },
+    });
+  });
+
+  it("maps Copilot runtime overrides into provider start options", () => {
+    expect(
+      getProviderStartOptions(
+        {
+          codexBinaryPath: "",
+          codexHomePath: "",
+          copilotCliUrl: " http://127.0.0.1:8123 ",
+          copilotConfigDir: " /tmp/copilot-config ",
+        },
+        "copilot",
+      ),
+    ).toEqual({
+      copilot: {
+        cliUrl: "http://127.0.0.1:8123",
+        configDir: "/tmp/copilot-config",
+      },
+    });
   });
 });
 

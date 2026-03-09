@@ -4,7 +4,12 @@ import { Effect, Layer, Sink, Stream } from "effect";
 import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
-import { checkCodexProviderStatus, parseAuthStatusFromOutput } from "./ProviderHealth";
+import {
+  checkCodexProviderStatus,
+  checkCopilotProviderStatus,
+  parseAuthStatusFromOutput,
+  parseCopilotAuthStatus,
+} from "./ProviderHealth";
 
 // ── Test helpers ────────────────────────────────────────────────────
 
@@ -183,6 +188,64 @@ it.effect("returns warning when login status command is unsupported", () =>
   ),
 );
 
+it.effect("returns ready when Copilot is installed and authenticated", () =>
+  Effect.gen(function* () {
+    const status = yield* checkCopilotProviderStatus({
+      clientFactory: () => ({
+        start: async () => undefined,
+        stop: async () => [],
+        getAuthStatus: async () => ({ authenticated: true }),
+      }),
+    });
+    assert.strictEqual(status.provider, "copilot");
+    assert.strictEqual(status.status, "ready");
+    assert.strictEqual(status.available, true);
+    assert.strictEqual(status.authStatus, "authenticated");
+  }),
+);
+
+it.effect("returns unauthenticated when Copilot auth probe reports signed out", () =>
+  Effect.gen(function* () {
+    const status = yield* checkCopilotProviderStatus({
+      clientFactory: () => ({
+        start: async () => undefined,
+        stop: async () => [],
+        getAuthStatus: async () => ({ status: "signed_out" }),
+      }),
+    });
+    assert.strictEqual(status.provider, "copilot");
+    assert.strictEqual(status.status, "error");
+    assert.strictEqual(status.available, true);
+    assert.strictEqual(status.authStatus, "unauthenticated");
+    assert.strictEqual(
+      status.message,
+      "GitHub Copilot is not authenticated. Sign in to Copilot and restart T3 Code.",
+    );
+  }),
+);
+
+it.effect("returns unavailable when Copilot client fails to start", () =>
+  Effect.gen(function* () {
+    const status = yield* checkCopilotProviderStatus({
+      clientFactory: () => ({
+        start: async () => {
+          throw new Error("backend unavailable");
+        },
+        stop: async () => [],
+        getAuthStatus: async () => ({ authenticated: true }),
+      }),
+    });
+    assert.strictEqual(status.provider, "copilot");
+    assert.strictEqual(status.status, "error");
+    assert.strictEqual(status.available, false);
+    assert.strictEqual(status.authStatus, "unknown");
+    assert.strictEqual(
+      status.message,
+      "GitHub Copilot is unavailable. Install or repair the Copilot CLI backend and restart T3 Code.",
+    );
+  }),
+);
+
 // ── Pure function tests ─────────────────────────────────────────────
 
 it("parseAuthStatusFromOutput: exit code 0 with no auth markers is ready", () => {
@@ -209,4 +272,16 @@ it("parseAuthStatusFromOutput: JSON without auth marker is warning", () => {
   });
   assert.strictEqual(parsed.status, "warning");
   assert.strictEqual(parsed.authStatus, "unknown");
+});
+
+it("parseCopilotAuthStatus: authenticated object is ready", () => {
+  const parsed = parseCopilotAuthStatus({ authenticated: true });
+  assert.strictEqual(parsed.status, "ready");
+  assert.strictEqual(parsed.authStatus, "authenticated");
+});
+
+it("parseCopilotAuthStatus: signed-out status is unauthenticated", () => {
+  const parsed = parseCopilotAuthStatus({ status: "signed_out" });
+  assert.strictEqual(parsed.status, "error");
+  assert.strictEqual(parsed.authStatus, "unauthenticated");
 });

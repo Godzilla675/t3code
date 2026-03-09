@@ -1,18 +1,20 @@
 import { Fragment, type ReactNode, createElement, useEffect } from "react";
 import {
   DEFAULT_MODEL_BY_PROVIDER,
+  DEFAULT_PROVIDER_KIND,
   type ProviderKind,
   ThreadId,
   type OrchestrationReadModel,
   type OrchestrationSessionStatus,
 } from "@t3tools/contracts";
-import {
-  getModelOptions,
-  normalizeModelSlug,
-  resolveModelSlug,
-  resolveModelSlugForProvider,
-} from "@t3tools/shared/model";
 import { create } from "zustand";
+import {
+  getAppSettingsSnapshot,
+  getAppModelOptions,
+  getCustomModelsForProvider,
+  inferProviderForAppModel,
+  resolveAppModelSelection,
+} from "./appSettings";
 import { type ChatMessage, type Project, type Thread } from "./types";
 
 // ── State ────────────────────────────────────────────────────────────
@@ -102,7 +104,10 @@ function mapProjectsFromReadModel(
   incoming: OrchestrationReadModel["projects"],
   previous: Project[],
 ): Project[] {
+  const settings = getAppSettingsSnapshot();
   return incoming.map((project) => {
+    const defaultModel = project.defaultModel ?? DEFAULT_MODEL_BY_PROVIDER.codex;
+    const inferredProvider = inferProviderForAppModel(settings, defaultModel);
     const existing =
       previous.find((entry) => entry.id === project.id) ??
       previous.find((entry) => entry.cwd === project.workspaceRoot);
@@ -112,7 +117,11 @@ function mapProjectsFromReadModel(
       cwd: project.workspaceRoot,
       model:
         existing?.model ??
-        resolveModelSlug(project.defaultModel ?? DEFAULT_MODEL_BY_PROVIDER.codex),
+        resolveAppModelSelection(
+          inferredProvider,
+          getCustomModelsForProvider(settings, inferredProvider),
+          defaultModel,
+        ),
       expanded:
         existing?.expanded ??
         (persistedExpandedProjectCwds.size > 0
@@ -143,26 +152,37 @@ function toLegacySessionStatus(
 }
 
 function toLegacyProvider(providerName: string | null): ProviderKind {
-  if (providerName === "codex") {
+  if (providerName === "codex" || providerName === "copilot") {
     return providerName;
   }
-  return "codex";
+  return DEFAULT_PROVIDER_KIND;
 }
-
-const CODEX_MODEL_SLUGS = new Set<string>(getModelOptions("codex").map((option) => option.slug));
 
 function inferProviderForThreadModel(input: {
   readonly model: string;
   readonly sessionProviderName: string | null;
 }): ProviderKind {
-  if (input.sessionProviderName === "codex") {
+  if (input.sessionProviderName === "codex" || input.sessionProviderName === "copilot") {
     return input.sessionProviderName;
   }
-  const normalizedCodex = normalizeModelSlug(input.model, "codex");
-  if (normalizedCodex && CODEX_MODEL_SLUGS.has(normalizedCodex)) {
-    return "codex";
+  return inferProviderForAppModel(getAppSettingsSnapshot(), input.model);
+}
+
+function hasRecognizedModelSelection(
+  settings: ReturnType<typeof getAppSettingsSnapshot>,
+  provider: ProviderKind,
+  model: string,
+): boolean {
+  const trimmedModel = model.trim();
+  if (trimmedModel.length === 0) {
+    return false;
   }
-  return "codex";
+
+  const options = getAppModelOptions(provider, getCustomModelsForProvider(settings, provider));
+  return options.some(
+    (option) =>
+      option.slug === trimmedModel || option.name.toLowerCase() === trimmedModel.toLowerCase(),
+  );
 }
 
 function resolveWsHttpOrigin(): string {
@@ -200,6 +220,7 @@ function attachmentPreviewRoutePath(attachmentId: string): string {
 // ── Pure state transition functions ────────────────────────────────────
 
 export function syncServerReadModel(state: AppState, readModel: OrchestrationReadModel): AppState {
+  const settings = getAppSettingsSnapshot();
   const projects = mapProjectsFromReadModel(
     readModel.projects.filter((project) => project.deletedAt === null),
     state.projects,
@@ -209,18 +230,21 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
     .filter((thread) => thread.deletedAt === null)
     .map((thread) => {
       const existing = existingThreadById.get(thread.id);
+      const sessionProviderName = thread.session?.providerName ?? null;
+      const provider = inferProviderForThreadModel({
+        model: thread.model,
+        sessionProviderName,
+      });
+      const customModels = getCustomModelsForProvider(settings, provider);
       return {
         id: thread.id,
         codexThreadId: null,
         projectId: thread.projectId,
         title: thread.title,
-        model: resolveModelSlugForProvider(
-          inferProviderForThreadModel({
-            model: thread.model,
-            sessionProviderName: thread.session?.providerName ?? null,
-          }),
-          thread.model,
-        ),
+        model:
+          sessionProviderName === null && !hasRecognizedModelSelection(settings, provider, thread.model)
+            ? DEFAULT_MODEL_BY_PROVIDER[provider]
+            : resolveAppModelSelection(provider, customModels, thread.model),
         runtimeMode: thread.runtimeMode,
         interactionMode: thread.interactionMode,
         session: thread.session

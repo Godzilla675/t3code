@@ -9,8 +9,12 @@
  *
  * @module ProviderServiceLive
  */
+import { randomUUID } from "node:crypto";
+
 import {
+  EventId,
   NonNegativeInt,
+  RuntimeRequestId,
   ThreadId,
   ProviderInterruptTurnInput,
   ProviderRespondToRequestInput,
@@ -18,12 +22,15 @@ import {
   ProviderSendTurnInput,
   ProviderSessionStartInput,
   ProviderStopSessionInput,
+  TurnId,
   type ProviderRuntimeEvent,
   type ProviderSession,
+  type ProviderStartOptions,
 } from "@t3tools/contracts";
 import { Effect, Layer, Option, PubSub, Queue, Schema, SchemaIssue, Stream } from "effect";
 
 import { ProviderValidationError } from "../Errors.ts";
+import { readPersistedProviderStartOptions } from "../providerStartOptions.ts";
 import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
 import {
@@ -42,6 +49,29 @@ const ProviderRollbackConversationInput = Schema.Struct({
   threadId: ThreadId,
   numTurns: NonNegativeInt,
 });
+
+const PENDING_APPROVAL_REQUESTS_KEY = "pendingApprovalRequests";
+const PENDING_USER_INPUT_REQUESTS_KEY = "pendingUserInputRequests";
+const RECENTLY_EXPIRED_REQUEST_TTL_MS = 15 * 60 * 1000;
+
+type PersistedPendingApprovalRequest = {
+  readonly requestId: string;
+  readonly requestType:
+    | "command_execution_approval"
+    | "file_read_approval"
+    | "file_change_approval"
+    | "apply_patch_approval"
+    | "exec_command_approval"
+    | "dynamic_tool_call"
+    | "auth_tokens_refresh"
+    | "unknown";
+  readonly turnId?: TurnId;
+};
+
+type PersistedPendingUserInputRequest = {
+  readonly requestId: string;
+  readonly turnId?: TurnId;
+};
 
 function toValidationError(
   operation: string,
@@ -86,25 +116,166 @@ function toRuntimeStatus(session: ProviderSession): "starting" | "running" | "st
   }
 }
 
-function toRuntimePayloadFromSession(session: ProviderSession): Record<string, unknown> {
+function toRuntimePayloadFromSession(
+  session: ProviderSession,
+  options?: {
+    readonly providerOptions?: ProviderStartOptions;
+  },
+): Record<string, unknown> {
   return {
     cwd: session.cwd ?? null,
     model: session.model ?? null,
     activeTurnId: session.activeTurnId ?? null,
     lastError: session.lastError ?? null,
+    [PENDING_APPROVAL_REQUESTS_KEY]: [],
+    [PENDING_USER_INPUT_REQUESTS_KEY]: [],
+    ...(options?.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function readPersistedCwd(
   runtimePayload: ProviderRuntimeBinding["runtimePayload"],
 ): string | undefined {
-  if (!runtimePayload || typeof runtimePayload !== "object" || Array.isArray(runtimePayload)) {
+  if (!isRecord(runtimePayload)) {
     return undefined;
   }
   const rawCwd = "cwd" in runtimePayload ? runtimePayload.cwd : undefined;
   if (typeof rawCwd !== "string") return undefined;
   const trimmed = rawCwd.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function readPersistedModel(
+  runtimePayload: ProviderRuntimeBinding["runtimePayload"],
+): string | undefined {
+  if (!isRecord(runtimePayload)) {
+    return undefined;
+  }
+  const rawModel = "model" in runtimePayload ? runtimePayload.model : undefined;
+  if (typeof rawModel !== "string") return undefined;
+  const trimmed = rawModel.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function readPersistedActiveTurnId(
+  runtimePayload: ProviderRuntimeBinding["runtimePayload"],
+): TurnId | undefined {
+  if (!isRecord(runtimePayload)) {
+    return undefined;
+  }
+  const rawActiveTurnId = "activeTurnId" in runtimePayload ? runtimePayload.activeTurnId : undefined;
+  if (typeof rawActiveTurnId !== "string") {
+    return undefined;
+  }
+  const trimmed = rawActiveTurnId.trim();
+  return trimmed.length > 0 ? TurnId.makeUnsafe(trimmed) : undefined;
+}
+
+function normalizePersistedRequestType(
+  value: unknown,
+): PersistedPendingApprovalRequest["requestType"] {
+  switch (value) {
+    case "command_execution_approval":
+    case "file_read_approval":
+    case "file_change_approval":
+    case "apply_patch_approval":
+    case "exec_command_approval":
+    case "dynamic_tool_call":
+    case "auth_tokens_refresh":
+      return value;
+    default:
+      return "unknown";
+  }
+}
+
+function normalizePersistedPendingApprovalRequest(
+  value: unknown,
+): PersistedPendingApprovalRequest | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const rawRequestId = typeof value.requestId === "string" ? value.requestId.trim() : "";
+  if (!rawRequestId) {
+    return undefined;
+  }
+  const rawTurnId = typeof value.turnId === "string" ? value.turnId.trim() : "";
+  return {
+    requestId: rawRequestId,
+    requestType: normalizePersistedRequestType(value.requestType),
+    ...(rawTurnId ? { turnId: TurnId.makeUnsafe(rawTurnId) } : {}),
+  };
+}
+
+function normalizePersistedPendingUserInputRequest(
+  value: unknown,
+): PersistedPendingUserInputRequest | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const rawRequestId = typeof value.requestId === "string" ? value.requestId.trim() : "";
+  if (!rawRequestId) {
+    return undefined;
+  }
+  const rawTurnId = typeof value.turnId === "string" ? value.turnId.trim() : "";
+  return {
+    requestId: rawRequestId,
+    ...(rawTurnId ? { turnId: TurnId.makeUnsafe(rawTurnId) } : {}),
+  };
+}
+
+function readPersistedPendingApprovalRequests(
+  runtimePayload: ProviderRuntimeBinding["runtimePayload"],
+): ReadonlyArray<PersistedPendingApprovalRequest> {
+  if (!isRecord(runtimePayload)) {
+    return [];
+  }
+  const rawRequests =
+    PENDING_APPROVAL_REQUESTS_KEY in runtimePayload ? runtimePayload[PENDING_APPROVAL_REQUESTS_KEY] : [];
+  if (!Array.isArray(rawRequests)) {
+    return [];
+  }
+  return rawRequests.flatMap((entry) => {
+    const normalized = normalizePersistedPendingApprovalRequest(entry);
+    return normalized ? [normalized] : [];
+  });
+}
+
+function readPersistedPendingUserInputRequests(
+  runtimePayload: ProviderRuntimeBinding["runtimePayload"],
+): ReadonlyArray<PersistedPendingUserInputRequest> {
+  if (!isRecord(runtimePayload)) {
+    return [];
+  }
+  const rawRequests =
+    PENDING_USER_INPUT_REQUESTS_KEY in runtimePayload
+      ? runtimePayload[PENDING_USER_INPUT_REQUESTS_KEY]
+      : [];
+  if (!Array.isArray(rawRequests)) {
+    return [];
+  }
+  return rawRequests.flatMap((entry) => {
+    const normalized = normalizePersistedPendingUserInputRequest(entry);
+    return normalized ? [normalized] : [];
+  });
+}
+
+function toPersistedRuntimeModel(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.toLowerCase() === "unknown") {
+    return undefined;
+  }
+  return trimmed;
+}
+
+function withoutPendingRequestId<T extends { readonly requestId: string }>(
+  requests: ReadonlyArray<T>,
+  requestId: string,
+): Array<T> {
+  return requests.filter((entry) => entry.requestId !== requestId);
 }
 
 const makeProviderService = (options?: ProviderServiceLiveOptions) =>
@@ -122,6 +293,8 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
     const directory = yield* ProviderSessionDirectory;
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+    const recentlyExpiredApprovalRequests = new Map<string, number>();
+    const recentlyExpiredUserInputRequests = new Map<string, number>();
 
     const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
       Effect.succeed(event).pipe(
@@ -134,9 +307,277 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         Effect.asVoid,
       );
 
+    const pruneExpiredRequestCache = (cache: Map<string, number>, currentTimeMs: number) => {
+      for (const [requestId, storedAtMs] of cache) {
+        if (currentTimeMs - storedAtMs > RECENTLY_EXPIRED_REQUEST_TTL_MS) {
+          cache.delete(requestId);
+        }
+      }
+    };
+
+    const rememberExpiredRequests = (cache: Map<string, number>, requestIds: ReadonlyArray<string>) => {
+      if (requestIds.length === 0) {
+        return;
+      }
+      const nowMs = Date.now();
+      pruneExpiredRequestCache(cache, nowMs);
+      for (const requestId of requestIds) {
+        cache.set(requestId, nowMs);
+      }
+    };
+
+    const wasRecentlyExpiredRequest = (cache: Map<string, number>, requestId: string): boolean => {
+      const nowMs = Date.now();
+      pruneExpiredRequestCache(cache, nowMs);
+      const storedAtMs = cache.get(requestId);
+      if (storedAtMs === undefined) {
+        return false;
+      }
+      if (nowMs - storedAtMs > RECENTLY_EXPIRED_REQUEST_TTL_MS) {
+        cache.delete(requestId);
+        return false;
+      }
+      return true;
+    };
+
+    const updatePersistedPendingApprovalRequests = (input: {
+      readonly threadId: ThreadId;
+      readonly provider: ProviderRuntimeEvent["provider"];
+      readonly update: (
+        current: ReadonlyArray<PersistedPendingApprovalRequest>,
+      ) => ReadonlyArray<PersistedPendingApprovalRequest>;
+    }) =>
+      directory.getBinding(input.threadId).pipe(
+        Effect.flatMap((bindingOption) => {
+          const binding = Option.getOrUndefined(bindingOption);
+          const next = input.update(
+            readPersistedPendingApprovalRequests(binding?.runtimePayload ?? null),
+          );
+          return directory.upsert({
+            threadId: input.threadId,
+            provider: input.provider,
+            runtimePayload: {
+              [PENDING_APPROVAL_REQUESTS_KEY]: next,
+            },
+          });
+        }),
+      );
+
+    const updatePersistedPendingUserInputRequests = (input: {
+      readonly threadId: ThreadId;
+      readonly provider: ProviderRuntimeEvent["provider"];
+      readonly update: (
+        current: ReadonlyArray<PersistedPendingUserInputRequest>,
+      ) => ReadonlyArray<PersistedPendingUserInputRequest>;
+    }) =>
+      directory.getBinding(input.threadId).pipe(
+        Effect.flatMap((bindingOption) => {
+          const binding = Option.getOrUndefined(bindingOption);
+          const next = input.update(
+            readPersistedPendingUserInputRequests(binding?.runtimePayload ?? null),
+          );
+          return directory.upsert({
+            threadId: input.threadId,
+            provider: input.provider,
+            runtimePayload: {
+              [PENDING_USER_INPUT_REQUESTS_KEY]: next,
+            },
+          });
+        }),
+      );
+
+    const expirePersistedPendingInteractiveRequests = (input: {
+      readonly binding: ProviderRuntimeBinding;
+      readonly reason: "service-startup" | "session-recovery";
+    }) =>
+      Effect.gen(function* () {
+        const pendingApprovalRequests = readPersistedPendingApprovalRequests(
+          input.binding.runtimePayload,
+        );
+        const pendingUserInputRequests = readPersistedPendingUserInputRequests(
+          input.binding.runtimePayload,
+        );
+        if (pendingApprovalRequests.length === 0 && pendingUserInputRequests.length === 0) {
+          return;
+        }
+
+        yield* directory.upsert({
+          threadId: input.binding.threadId,
+          provider: input.binding.provider,
+          runtimePayload: {
+            [PENDING_APPROVAL_REQUESTS_KEY]: [],
+            [PENDING_USER_INPUT_REQUESTS_KEY]: [],
+          },
+        });
+
+        rememberExpiredRequests(
+          recentlyExpiredApprovalRequests,
+          pendingApprovalRequests.map((request) => request.requestId),
+        );
+        rememberExpiredRequests(
+          recentlyExpiredUserInputRequests,
+          pendingUserInputRequests.map((request) => request.requestId),
+        );
+
+        const createdAt = new Date().toISOString();
+        const staleRequestEvents: Array<ProviderRuntimeEvent> = [
+          ...pendingApprovalRequests.map(
+            (request) =>
+              ({
+                eventId: EventId.makeUnsafe(randomUUID()),
+                provider: input.binding.provider,
+                threadId: input.binding.threadId,
+                createdAt,
+                ...(request.turnId !== undefined ? { turnId: request.turnId } : {}),
+                requestId: RuntimeRequestId.makeUnsafe(request.requestId),
+                type: "request.resolved",
+                payload: {
+                  requestType: request.requestType,
+                  decision: "cancel",
+                  resolution: {
+                    decision: "cancel",
+                    reason: "expired-after-restart",
+                  },
+                },
+              }) satisfies ProviderRuntimeEvent,
+          ),
+          ...pendingUserInputRequests.map(
+            (request) =>
+              ({
+                eventId: EventId.makeUnsafe(randomUUID()),
+                provider: input.binding.provider,
+                threadId: input.binding.threadId,
+                createdAt,
+                ...(request.turnId !== undefined ? { turnId: request.turnId } : {}),
+                requestId: RuntimeRequestId.makeUnsafe(request.requestId),
+                type: "user-input.resolved",
+                payload: {
+                  answers: {},
+                },
+              }) satisfies ProviderRuntimeEvent,
+          ),
+          {
+            eventId: EventId.makeUnsafe(randomUUID()),
+            provider: input.binding.provider,
+            threadId: input.binding.threadId,
+            createdAt,
+            type: "runtime.warning",
+            payload: {
+              message:
+                input.reason === "service-startup"
+                  ? "Cleared stale interactive provider requests after service restart."
+                  : "Cleared stale interactive provider requests while recovering the provider session.",
+              detail: {
+                reason: input.reason,
+                approvalRequestIds: pendingApprovalRequests.map((request) => request.requestId),
+                userInputRequestIds: pendingUserInputRequests.map((request) => request.requestId),
+              },
+            },
+          } satisfies ProviderRuntimeEvent,
+        ];
+
+        yield* Queue.offerAll(runtimeEventQueue, staleRequestEvents).pipe(Effect.asVoid);
+      });
+
+    const persistRuntimeEventProjection = (event: ProviderRuntimeEvent) => {
+      switch (event.type) {
+        case "turn.started": {
+          const model = toPersistedRuntimeModel(event.payload.model);
+          return directory.upsert({
+            threadId: event.threadId,
+            provider: event.provider,
+            runtimePayload: {
+              ...(model ? { model } : {}),
+              ...(event.turnId !== undefined ? { activeTurnId: event.turnId } : {}),
+            },
+          });
+        }
+        case "turn.completed":
+        case "turn.aborted": {
+          return directory.upsert({
+            threadId: event.threadId,
+            provider: event.provider,
+            runtimePayload: {
+              activeTurnId: null,
+            },
+          });
+        }
+        case "model.rerouted": {
+          const model = toPersistedRuntimeModel(event.payload.toModel);
+          return model
+            ? directory.upsert({
+                threadId: event.threadId,
+                provider: event.provider,
+                runtimePayload: {
+                  model,
+                },
+              })
+            : Effect.void;
+        }
+        case "request.opened": {
+          if (event.requestId === undefined || event.payload.requestType === "tool_user_input") {
+            return Effect.void;
+          }
+          return updatePersistedPendingApprovalRequests({
+            threadId: event.threadId,
+            provider: event.provider,
+            update: (current) => [
+              ...withoutPendingRequestId(current, String(event.requestId)),
+              {
+                requestId: String(event.requestId),
+                requestType: normalizePersistedRequestType(event.payload.requestType),
+                ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
+              },
+            ],
+          });
+        }
+        case "request.resolved": {
+          if (event.requestId === undefined || event.payload.requestType === "tool_user_input") {
+            return Effect.void;
+          }
+          return updatePersistedPendingApprovalRequests({
+            threadId: event.threadId,
+            provider: event.provider,
+            update: (current) => withoutPendingRequestId(current, String(event.requestId)),
+          });
+        }
+        case "user-input.requested": {
+          if (event.requestId === undefined) {
+            return Effect.void;
+          }
+          return updatePersistedPendingUserInputRequests({
+            threadId: event.threadId,
+            provider: event.provider,
+            update: (current) => [
+              ...withoutPendingRequestId(current, String(event.requestId)),
+              {
+                requestId: String(event.requestId),
+                ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
+              },
+            ],
+          });
+        }
+        case "user-input.resolved": {
+          if (event.requestId === undefined) {
+            return Effect.void;
+          }
+          return updatePersistedPendingUserInputRequests({
+            threadId: event.threadId,
+            provider: event.provider,
+            update: (current) => withoutPendingRequestId(current, String(event.requestId)),
+          });
+        }
+        default:
+          return Effect.void;
+      }
+    };
+
     const upsertSessionBinding = (
       session: ProviderSession,
       threadId: ThreadId,
+      options?: {
+        readonly providerOptions?: ProviderStartOptions;
+      },
     ) =>
       directory.upsert({
         threadId,
@@ -144,7 +585,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         runtimeMode: session.runtimeMode,
         status: toRuntimeStatus(session),
         ...(session.resumeCursor !== undefined ? { resumeCursor: session.resumeCursor } : {}),
-        runtimePayload: toRuntimePayloadFromSession(session),
+        runtimePayload: toRuntimePayloadFromSession(session, options),
       });
 
     const providers = yield* registry.listProviders();
@@ -153,17 +594,27 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
     );
 
     const processRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
-      publishRuntimeEvent(event);
+      persistRuntimeEventProjection(event).pipe(
+        Effect.catch((cause: unknown) =>
+          Effect.logWarning("failed to persist provider runtime projection", {
+            cause,
+            threadId: event.threadId,
+            provider: event.provider,
+            eventType: event.type,
+          }),
+        ),
+        Effect.andThen(publishRuntimeEvent(event)),
+      );
 
     const worker = Effect.forever(
       Queue.take(runtimeEventQueue).pipe(Effect.flatMap(processRuntimeEvent)),
     );
-    yield* Effect.forkScoped(worker);
+    yield* worker.pipe(Effect.forkScoped({ startImmediately: true }));
 
     yield* Effect.forEach(adapters, (adapter) =>
       Stream.runForEach(adapter.streamEvents, (event) =>
         Queue.offer(runtimeEventQueue, event).pipe(Effect.asVoid),
-      ).pipe(Effect.forkScoped),
+      ).pipe(Effect.forkScoped({ startImmediately: true })),
     ).pipe(Effect.asVoid);
 
     const recoverSessionForThread = (input: {
@@ -189,6 +640,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           }
         }
 
+        yield* expirePersistedPendingInteractiveRequests({
+          binding: input.binding,
+          reason: "session-recovery",
+        });
+
         if (!hasResumeCursor) {
           return yield* toValidationError(
             input.operation,
@@ -197,11 +653,17 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         }
 
         const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
+        const persistedModel = readPersistedModel(input.binding.runtimePayload);
+        const persistedActiveTurnId = readPersistedActiveTurnId(input.binding.runtimePayload);
+        const persistedProviderOptions = readPersistedProviderStartOptions(input.binding.runtimePayload);
 
         const resumed = yield* adapter.startSession({
           threadId: input.binding.threadId,
           provider: input.binding.provider,
           ...(persistedCwd ? { cwd: persistedCwd } : {}),
+          ...(persistedModel ? { model: persistedModel } : {}),
+          ...(persistedActiveTurnId !== undefined ? { activeTurnId: persistedActiveTurnId } : {}),
+          ...(persistedProviderOptions ? { providerOptions: persistedProviderOptions } : {}),
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
           runtimeMode: input.binding.runtimeMode ?? "full-access",
         });
@@ -220,6 +682,101 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         });
         return { adapter, session: resumed } as const;
       });
+
+    const clearUnrecoverableStartupRuntimeState = (input: {
+      readonly binding: ProviderRuntimeBinding;
+      readonly detail: string;
+    }) =>
+      Effect.gen(function* () {
+        yield* directory.upsert({
+          threadId: input.binding.threadId,
+          provider: input.binding.provider,
+          status: "stopped",
+          runtimePayload: {
+            activeTurnId: null,
+            [PENDING_APPROVAL_REQUESTS_KEY]: [],
+            [PENDING_USER_INPUT_REQUESTS_KEY]: [],
+            lastError: input.detail,
+          },
+        });
+        yield* Queue.offer(runtimeEventQueue, {
+          eventId: EventId.makeUnsafe(randomUUID()),
+          provider: input.binding.provider,
+          threadId: input.binding.threadId,
+          createdAt: new Date().toISOString(),
+          type: "runtime.warning",
+          payload: {
+            message: input.detail,
+          },
+        } satisfies ProviderRuntimeEvent).pipe(Effect.asVoid);
+      });
+
+    const reconcilePersistedBindingsOnStartup = Effect.gen(function* () {
+      const threadIds = yield* directory.listThreadIds();
+      yield* Effect.forEach(
+        threadIds,
+        (threadId) =>
+          directory.getBinding(threadId).pipe(
+            Effect.flatMap((bindingOption) => {
+              const binding = Option.getOrUndefined(bindingOption);
+              if (!binding) {
+                return Effect.void;
+              }
+
+              const hasPersistedActiveTurn =
+                readPersistedActiveTurnId(binding.runtimePayload) !== undefined;
+              const hasPendingRequests =
+                readPersistedPendingApprovalRequests(binding.runtimePayload).length > 0 ||
+                readPersistedPendingUserInputRequests(binding.runtimePayload).length > 0;
+
+              if (!hasPersistedActiveTurn && !hasPendingRequests) {
+                return Effect.void;
+              }
+
+              if (hasPersistedActiveTurn) {
+                return recoverSessionForThread({
+                  binding,
+                  operation: "ProviderService.reconcilePersistedSessions",
+                }).pipe(
+                  Effect.asVoid,
+                  Effect.catch((cause: unknown) => {
+                    const detail =
+                      cause instanceof Error
+                        ? cause.message
+                        : `Provider session recovery failed during startup: ${String(cause)}`;
+                    return clearUnrecoverableStartupRuntimeState({
+                      binding,
+                      detail,
+                    }).pipe(
+                      Effect.andThen(
+                        Effect.logWarning("failed to reconcile persisted provider session on startup", {
+                          cause,
+                          threadId: binding.threadId,
+                          provider: binding.provider,
+                        }),
+                      ),
+                    );
+                  }),
+                );
+              }
+
+              return expirePersistedPendingInteractiveRequests({
+                binding,
+                reason: "service-startup",
+              }).pipe(
+                Effect.catch((cause: unknown) =>
+                  Effect.logWarning("failed to expire stale persisted provider requests on startup", {
+                    cause,
+                    threadId: binding.threadId,
+                    provider: binding.provider,
+                  }),
+                ),
+              );
+            }),
+          ),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.asVoid);
+    });
 
     const resolveRoutableSession = (input: {
       readonly threadId: ThreadId;
@@ -273,7 +830,13 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           );
         }
 
-        yield* upsertSessionBinding(session, threadId);
+        yield* upsertSessionBinding(
+          session,
+          threadId,
+          input.providerOptions !== undefined
+            ? { providerOptions: input.providerOptions }
+            : undefined,
+        );
         yield* analytics.record("provider.session.started", {
           provider: session.provider,
           runtimeMode: input.runtimeMode,
@@ -315,6 +878,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           status: "running",
           ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
           runtimePayload: {
+            ...(input.model !== undefined ? { model: input.model } : {}),
             activeTurnId: turn.turnId,
             lastRuntimeEvent: "provider.sendTurn",
             lastRuntimeEventAt: new Date().toISOString(),
@@ -360,6 +924,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           operation: "ProviderService.respondToRequest",
           allowRecovery: true,
         });
+        if (wasRecentlyExpiredRequest(recentlyExpiredApprovalRequests, String(input.requestId))) {
+          return;
+        }
         yield* routed.adapter.respondToRequest(routed.threadId, input.requestId, input.decision);
         yield* analytics.record("provider.request.responded", {
           provider: routed.adapter.provider,
@@ -379,6 +946,9 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           operation: "ProviderService.respondToUserInput",
           allowRecovery: true,
         });
+        if (wasRecentlyExpiredRequest(recentlyExpiredUserInputRequests, String(input.requestId))) {
+          return;
+        }
         yield* routed.adapter.respondToUserInput(routed.threadId, input.requestId, input.answers);
       });
 
@@ -401,6 +971,16 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         yield* analytics.record("provider.session.stopped", {
           provider: routed.adapter.provider,
         });
+      });
+
+    const stopSessionForProvider: ProviderServiceShape["stopSessionForProvider"] = (input) =>
+      Effect.gen(function* () {
+        const adapter = yield* registry.getByProvider(input.provider);
+        const hasSession = yield* adapter.hasSession(input.threadId);
+        if (!hasSession) {
+          return;
+        }
+        yield* adapter.stopSession(input.threadId);
       });
 
     const listSessions: ProviderServiceShape["listSessions"] = () =>
@@ -430,28 +1010,42 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           }
         }
 
-        return activeSessions.map((session) => {
-          const binding = bindingsByThreadId.get(session.threadId);
-          if (!binding) {
-            return session;
-          }
+        return activeSessions
+          .filter((session) => {
+            const binding = bindingsByThreadId.get(session.threadId);
+            return binding !== undefined && binding.provider === session.provider;
+          })
+          .map((session) => {
+            const binding = bindingsByThreadId.get(session.threadId);
+            if (!binding) {
+              return session;
+            }
 
-          const overrides: {
-            resumeCursor?: ProviderSession["resumeCursor"];
-            runtimeMode?: ProviderSession["runtimeMode"];
-          } = {};
-          if (session.resumeCursor === undefined && binding.resumeCursor !== undefined) {
-            overrides.resumeCursor = binding.resumeCursor;
-          }
-          if (binding.runtimeMode !== undefined) {
-            overrides.runtimeMode = binding.runtimeMode;
-          }
-          return Object.assign({}, session, overrides);
-        });
+            const overrides: {
+              resumeCursor?: ProviderSession["resumeCursor"];
+              runtimeMode?: ProviderSession["runtimeMode"];
+            } = {};
+            if (session.resumeCursor === undefined && binding.resumeCursor !== undefined) {
+              overrides.resumeCursor = binding.resumeCursor;
+            }
+            if (binding.runtimeMode !== undefined) {
+              overrides.runtimeMode = binding.runtimeMode;
+            }
+            return Object.assign({}, session, overrides);
+          });
       });
 
     const getCapabilities: ProviderServiceShape["getCapabilities"] = (provider) =>
       registry.getByProvider(provider).pipe(Effect.map((adapter) => adapter.capabilities));
+
+    const reconcilePersistedSessions: ProviderServiceShape["reconcilePersistedSessions"] = () =>
+      reconcilePersistedBindingsOnStartup.pipe(
+        Effect.catch((cause: unknown) =>
+          Effect.logWarning("failed to reconcile persisted provider sessions", {
+            cause,
+          }),
+        ),
+      );
 
     const rollbackConversation: ProviderServiceShape["rollbackConversation"] = (rawInput) =>
       Effect.gen(function* () {
@@ -478,7 +1072,6 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
     const runStopAll = () =>
       Effect.gen(function* () {
         const threadIds = yield* directory.listThreadIds();
-        yield* Effect.forEach(adapters, (adapter) => adapter.stopAll()).pipe(Effect.asVoid);
         yield* Effect.forEach(threadIds, (threadId) =>
           directory.getProvider(threadId).pipe(
             Effect.flatMap((provider) =>
@@ -488,6 +1081,8 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
                 status: "stopped",
                 runtimePayload: {
                   activeTurnId: null,
+                  [PENDING_APPROVAL_REQUESTS_KEY]: [],
+                  [PENDING_USER_INPUT_REQUESTS_KEY]: [],
                   lastRuntimeEvent: "provider.stopAll",
                   lastRuntimeEventAt: new Date().toISOString(),
                 },
@@ -514,8 +1109,10 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       respondToRequest,
       respondToUserInput,
       stopSession,
+      stopSessionForProvider,
       listSessions,
       getCapabilities,
+      reconcilePersistedSessions,
       rollbackConversation,
       streamEvents: Stream.fromPubSub(runtimeEventPubSub),
     } satisfies ProviderServiceShape;

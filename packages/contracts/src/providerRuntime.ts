@@ -20,6 +20,9 @@ const RuntimeEventRawSource = Schema.Literals([
   "codex.app-server.request",
   "codex.eventmsg",
   "codex.sdk.thread-event",
+  "copilot.sdk.event",
+  "copilot.sdk.permission-request",
+  "copilot.sdk.user-input-request",
 ]);
 export type RuntimeEventRawSource = typeof RuntimeEventRawSource.Type;
 

@@ -13,12 +13,16 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import { Effect, Exit, Layer, ManagedRuntime, PubSub, Scope, Stream } from "effect";
+import { Effect, Exit, Layer, ManagedRuntime, Option, PubSub, Scope, Stream } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "../../git/Errors.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
+import {
+  ProviderSessionDirectory,
+  type ProviderRuntimeBinding,
+} from "../../provider/Services/ProviderSessionDirectory.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
@@ -87,13 +91,14 @@ describe("ProviderCommandReactor", () => {
     const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
     let nextSessionIndex = 1;
     const runtimeSessions: Array<ProviderSession> = [];
+    const runtimeBindings = new Map<ThreadId, ProviderRuntimeBinding>();
     const startSession = vi.fn((_: unknown, input: unknown) => {
       const sessionIndex = nextSessionIndex++;
       const provider =
         typeof input === "object" &&
         input !== null &&
         "provider" in input &&
-        input.provider === "codex"
+        (input.provider === "codex" || input.provider === "copilot")
           ? input.provider
           : "codex";
       const resumeCursor =
@@ -127,7 +132,28 @@ describe("ProviderCommandReactor", () => {
         createdAt: now,
         updatedAt: now,
       };
-      runtimeSessions.push(session);
+      const existingIndex = runtimeSessions.findIndex((existing) => existing.threadId === threadId);
+      if (existingIndex >= 0) {
+        runtimeSessions.splice(existingIndex, 1, session);
+      } else {
+        runtimeSessions.push(session);
+      }
+      runtimeBindings.set(threadId, {
+        threadId,
+        provider,
+        runtimeMode: session.runtimeMode,
+        status: "running",
+        resumeCursor: session.resumeCursor,
+        runtimePayload: {
+          ...(model !== undefined ? { model } : {}),
+          ...(typeof input === "object" &&
+          input !== null &&
+          "providerOptions" in input &&
+          input.providerOptions !== undefined
+            ? { providerOptions: input.providerOptions }
+            : {}),
+        },
+      });
       return Effect.succeed(session);
     });
     const sendTurn = vi.fn((_: unknown) =>
@@ -149,6 +175,16 @@ describe("ProviderCommandReactor", () => {
           return;
         }
         const index = runtimeSessions.findIndex((session) => session.threadId === threadId);
+        if (index >= 0) {
+          runtimeSessions.splice(index, 1);
+        }
+      }),
+    );
+    const stopSessionForProvider = vi.fn((input: { threadId: ThreadId; provider: "codex" | "copilot" }) =>
+      Effect.sync(() => {
+        const index = runtimeSessions.findIndex(
+          (session) => session.threadId === input.threadId && session.provider === input.provider,
+        );
         if (index >= 0) {
           runtimeSessions.splice(index, 1);
         }
@@ -182,13 +218,37 @@ describe("ProviderCommandReactor", () => {
       respondToRequest: respondToRequest as ProviderServiceShape["respondToRequest"],
       respondToUserInput: respondToUserInput as ProviderServiceShape["respondToUserInput"],
       stopSession: stopSession as ProviderServiceShape["stopSession"],
+      stopSessionForProvider:
+        stopSessionForProvider as ProviderServiceShape["stopSessionForProvider"],
       listSessions: () => Effect.succeed(runtimeSessions),
       getCapabilities: (provider) =>
         Effect.succeed({
           sessionModelSwitch: provider === "codex" ? "in-session" : "in-session",
         }),
+      reconcilePersistedSessions: () => Effect.void,
       rollbackConversation: () => unsupported(),
       streamEvents: Stream.fromPubSub(runtimeEventPubSub),
+    };
+    const directoryService: typeof ProviderSessionDirectory.Service = {
+      upsert: (binding) =>
+        Effect.sync(() => {
+          runtimeBindings.set(binding.threadId, binding);
+        }),
+      getProvider: (threadId) => {
+        const binding = runtimeBindings.get(threadId);
+        return binding ? Effect.succeed(binding.provider) : unsupported();
+      },
+      getBinding: (threadId) =>
+        Effect.succeed(
+          runtimeBindings.has(threadId)
+            ? Option.some(runtimeBindings.get(threadId)!)
+            : Option.none<ProviderRuntimeBinding>(),
+        ),
+      remove: (threadId) =>
+        Effect.sync(() => {
+          runtimeBindings.delete(threadId);
+        }),
+      listThreadIds: () => Effect.succeed(Array.from(runtimeBindings.keys())),
     };
 
     const orchestrationLayer = OrchestrationEngineLive.pipe(
@@ -200,6 +260,7 @@ describe("ProviderCommandReactor", () => {
     const layer = ProviderCommandReactorLive.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
+      Layer.provideMerge(Layer.succeed(ProviderSessionDirectory, directoryService)),
       Layer.provideMerge(Layer.succeed(GitCore, { renameBranch } as unknown as GitCoreShape)),
       Layer.provideMerge(
         Layer.succeed(TextGeneration, { generateBranchName } as unknown as TextGenerationShape),
@@ -250,6 +311,7 @@ describe("ProviderCommandReactor", () => {
       respondToRequest,
       respondToUserInput,
       stopSession,
+      stopSessionForProvider,
       renameBranch,
       generateBranchName,
       stateDir,
@@ -339,6 +401,47 @@ describe("ProviderCommandReactor", () => {
         codex: {
           reasoningEffort: "high",
           fastMode: true,
+        },
+      },
+    });
+  });
+
+  it("forwards provider runtime options through session start", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-copilot-options"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-copilot-options"),
+          role: "user",
+          text: "hello copilot",
+          attachments: [],
+        },
+        provider: "copilot",
+        providerOptions: {
+          copilot: {
+            cliUrl: "http://127.0.0.1:8123",
+            configDir: "/tmp/copilot-config",
+          },
+        },
+        model: "gpt-5",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    expect(harness.startSession.mock.calls[0]?.[1]).toMatchObject({
+      provider: "copilot",
+      providerOptions: {
+        copilot: {
+          cliUrl: "http://127.0.0.1:8123",
+          configDir: "/tmp/copilot-config",
         },
       },
     });
@@ -511,6 +614,319 @@ describe("ProviderCommandReactor", () => {
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.makeUnsafe("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("restarts the provider session when provider runtime options change", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-provider-options-1"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-provider-options-1"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        provider: "copilot",
+        providerOptions: {
+          copilot: {
+            cliUrl: "http://127.0.0.1:8123",
+            configDir: "/tmp/copilot-config-a",
+          },
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-provider-options-2"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-provider-options-2"),
+          role: "user",
+          text: "second",
+          attachments: [],
+        },
+        provider: "copilot",
+        providerOptions: {
+          copilot: {
+            cliUrl: "http://127.0.0.1:9000",
+            configDir: "/tmp/copilot-config-b",
+          },
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+    expect(harness.stopSession.mock.calls.length).toBe(0);
+    expect(harness.startSession.mock.calls[1]?.[1]).toMatchObject({
+      provider: "copilot",
+      resumeCursor: { opaque: "cursor-1" },
+      providerOptions: {
+        copilot: {
+          cliUrl: "http://127.0.0.1:9000",
+          configDir: "/tmp/copilot-config-b",
+        },
+      },
+    });
+  });
+
+  it("reuses the persisted resume cursor after a cold restart when provider runtime options change", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-provider-options-cold-1"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-provider-options-cold-1"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        provider: "copilot",
+        providerOptions: {
+          copilot: {
+            cliUrl: "http://127.0.0.1:8123",
+            configDir: "/tmp/copilot-config-a",
+          },
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await Effect.runPromise(
+      harness.stopSession({
+        threadId: ThreadId.makeUnsafe("thread-1"),
+      }),
+    );
+    harness.stopSession.mockClear();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-provider-options-cold-2"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-provider-options-cold-2"),
+          role: "user",
+          text: "second",
+          attachments: [],
+        },
+        provider: "copilot",
+        providerOptions: {
+          copilot: {
+            cliUrl: "http://127.0.0.1:9000",
+            configDir: "/tmp/copilot-config-b",
+          },
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+    expect(harness.startSession.mock.calls[1]?.[1]).toMatchObject({
+      provider: "copilot",
+      resumeCursor: { opaque: "cursor-1" },
+      providerOptions: {
+        copilot: {
+          cliUrl: "http://127.0.0.1:9000",
+          configDir: "/tmp/copilot-config-b",
+        },
+      },
+    });
+  });
+
+  it("reuses persisted provider runtime options on cold-restart runtime-mode changes", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.makeUnsafe("cmd-runtime-mode-set-cold-initial"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        runtimeMode: "full-access",
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-runtime-mode-cold-1"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-runtime-mode-cold-1"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        provider: "copilot",
+        providerOptions: {
+          copilot: {
+            cliUrl: "http://127.0.0.1:8123",
+            configDir: "/tmp/copilot-config-cold",
+          },
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await Effect.runPromise(
+      harness.stopSession({
+        threadId: ThreadId.makeUnsafe("thread-1"),
+      }),
+    );
+    harness.stopSession.mockClear();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.makeUnsafe("cmd-runtime-mode-set-cold-next"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    expect(harness.startSession.mock.calls[1]?.[1]).toMatchObject({
+      provider: "copilot",
+      runtimeMode: "approval-required",
+      resumeCursor: { opaque: "cursor-1" },
+      providerOptions: {
+        copilot: {
+          cliUrl: "http://127.0.0.1:8123",
+          configDir: "/tmp/copilot-config-cold",
+        },
+      },
+    });
+  });
+
+  it("preserves copilot as the current provider when restarting an existing session", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-session-set-copilot"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "ready",
+          providerName: "copilot",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.makeUnsafe("cmd-runtime-mode-set-copilot"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    expect(harness.startSession.mock.calls[0]?.[1]).toMatchObject({
+      threadId: ThreadId.makeUnsafe("thread-1"),
+      provider: "copilot",
+      runtimeMode: "approval-required",
+    });
+  });
+
+  it("stops the previous provider session after switching providers", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-switch-provider-1"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-switch-provider-1"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        provider: "codex",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-switch-provider-2"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-switch-provider-2"),
+          role: "user",
+          text: "second",
+          attachments: [],
+        },
+        provider: "copilot",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+    expect(harness.stopSessionForProvider.mock.calls).toEqual([
+      [
+        {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          provider: "codex",
+        },
+      ],
+    ]);
   });
 
   it("does not stop the active session when restart fails before rebind", async () => {

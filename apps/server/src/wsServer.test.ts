@@ -252,6 +252,18 @@ function waitForMessage(ws: WebSocket): Promise<unknown> {
   });
 }
 
+async function waitForPushMatching(
+  ws: WebSocket,
+  predicate: (message: WsPush) => boolean,
+): Promise<WsPush> {
+  while (true) {
+    const message = (await waitForMessage(ws)) as WsPush;
+    if (message?.type === "push" && predicate(message)) {
+      return message;
+    }
+  }
+}
+
 function asWebSocketResponse(message: unknown): WebSocketResponse | null {
   if (typeof message !== "object" || message === null) return null;
   if (!("id" in message)) return null;
@@ -1169,8 +1181,10 @@ describe("WebSocket Server", () => {
       respondToRequest: () => unsupported(),
       respondToUserInput: () => unsupported(),
       stopSession: () => unsupported(),
+      stopSessionForProvider: () => unsupported(),
       listSessions: () => Effect.succeed([]),
       getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+      reconcilePersistedSessions: () => Effect.void,
       rollbackConversation: () => unsupported(),
       streamEvents: Stream.fromPubSub(runtimeEventPubSub),
     };
@@ -1333,7 +1347,10 @@ describe("WebSocket Server", () => {
     };
     terminalManager.emitEvent(manualEvent);
 
-    const push = (await waitForMessage(ws)) as WsPush;
+    const push = await waitForPushMatching(
+      ws,
+      (message) => message.channel === WS_CHANNELS.terminalEvent,
+    );
     expect(push.type).toBe("push");
     expect(push.channel).toBe(WS_CHANNELS.terminalEvent);
     expect((push.data as TerminalEvent).type).toBe("output");

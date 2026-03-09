@@ -8,6 +8,8 @@ import { ZapIcon } from "lucide-react";
 import {
   APP_SERVICE_TIER_OPTIONS,
   MAX_CUSTOM_MODEL_LENGTH,
+  getCustomModelsForProvider,
+  patchCustomModelsForProvider,
   shouldShowFastTierIcon,
   useAppSettings,
 } from "../appSettings";
@@ -54,37 +56,14 @@ const MODEL_PROVIDER_SETTINGS: Array<{
     placeholder: "your-codex-model-slug",
     example: "gpt-6.7-codex-ultra-preview",
   },
+  {
+    provider: "copilot",
+    title: "Copilot",
+    description: "Save additional Copilot model slugs for the picker and `/model` command.",
+    placeholder: "your-copilot-model-slug",
+    example: "gpt-5",
+  },
 ] as const;
-
-function getCustomModelsForProvider(
-  settings: ReturnType<typeof useAppSettings>["settings"],
-  provider: ProviderKind,
-) {
-  switch (provider) {
-    case "codex":
-    default:
-      return settings.customCodexModels;
-  }
-}
-
-function getDefaultCustomModelsForProvider(
-  defaults: ReturnType<typeof useAppSettings>["defaults"],
-  provider: ProviderKind,
-) {
-  switch (provider) {
-    case "codex":
-    default:
-      return defaults.customCodexModels;
-  }
-}
-
-function patchCustomModels(provider: ProviderKind, models: string[]) {
-  switch (provider) {
-    case "codex":
-    default:
-      return { customCodexModels: models };
-  }
-}
 
 function SettingsRouteView() {
   const { theme, setTheme, resolvedTheme } = useTheme();
@@ -96,6 +75,7 @@ function SettingsRouteView() {
     Record<ProviderKind, string>
   >({
     codex: "",
+    copilot: "",
   });
   const [customModelErrorByProvider, setCustomModelErrorByProvider] = useState<
     Partial<Record<ProviderKind, string | null>>
@@ -103,6 +83,8 @@ function SettingsRouteView() {
 
   const codexBinaryPath = settings.codexBinaryPath;
   const codexHomePath = settings.codexHomePath;
+  const copilotCliUrl = settings.copilotCliUrl;
+  const copilotConfigDir = settings.copilotConfigDir;
   const codexServiceTier = settings.codexServiceTier;
   const keybindingsConfigPath = serverConfigQuery.data?.keybindingsConfigPath ?? null;
 
@@ -156,7 +138,7 @@ function SettingsRouteView() {
       return;
     }
 
-    updateSettings(patchCustomModels(provider, [...customModels, normalized]));
+    updateSettings(patchCustomModelsForProvider(provider, [...customModels, normalized]));
     setCustomModelInputByProvider((existing) => ({
       ...existing,
       [provider]: "",
@@ -170,7 +152,9 @@ function SettingsRouteView() {
   const removeCustomModel = useCallback(
     (provider: ProviderKind, slug: string) => {
       const customModels = getCustomModelsForProvider(settings, provider);
-      updateSettings(patchCustomModels(provider, customModels.filter((model) => model !== slug)));
+      updateSettings(
+        patchCustomModelsForProvider(provider, customModels.filter((model) => model !== slug)),
+      );
       setCustomModelErrorByProvider((existing) => ({
         ...existing,
         [provider]: null,
@@ -302,6 +286,67 @@ function SettingsRouteView() {
 
             <section className="rounded-2xl border border-border bg-card p-5">
               <div className="mb-4">
+                <h2 className="text-sm font-medium text-foreground">GitHub Copilot runtime</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  These overrides apply to new Copilot sessions and let you target a non-default
+                  Copilot backend or config directory.
+                </p>
+              </div>
+
+              <div className="space-y-4">
+                <label htmlFor="copilot-cli-url" className="block space-y-1">
+                  <span className="text-xs font-medium text-foreground">Copilot CLI URL</span>
+                  <Input
+                    id="copilot-cli-url"
+                    value={copilotCliUrl}
+                    onChange={(event) => updateSettings({ copilotCliUrl: event.target.value })}
+                    placeholder="http://127.0.0.1:8123"
+                    spellCheck={false}
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    Leave blank to use the default local Copilot backend.
+                  </span>
+                </label>
+
+                <label htmlFor="copilot-config-dir" className="block space-y-1">
+                  <span className="text-xs font-medium text-foreground">Copilot config directory</span>
+                  <Input
+                    id="copilot-config-dir"
+                    value={copilotConfigDir}
+                    onChange={(event) => updateSettings({ copilotConfigDir: event.target.value })}
+                    placeholder="/Users/you/.config/github-copilot"
+                    spellCheck={false}
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    Optional custom GitHub Copilot config directory.
+                  </span>
+                </label>
+
+                <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <p>
+                    Backend:{" "}
+                    <span className="font-medium text-foreground">
+                      {copilotCliUrl || "default local backend"}
+                    </span>
+                  </p>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() =>
+                      updateSettings({
+                        copilotCliUrl: defaults.copilotCliUrl,
+                        copilotConfigDir: defaults.copilotConfigDir,
+                      })
+                    }
+                  >
+                    Reset Copilot overrides
+                  </Button>
+                </div>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-border bg-card p-5">
+              <div className="mb-4">
                 <h2 className="text-sm font-medium text-foreground">Models</h2>
                 <p className="mt-1 text-xs text-muted-foreground">
                   Save additional provider model slugs so they appear in the chat model picker and
@@ -425,14 +470,13 @@ function SettingsRouteView() {
                                 size="xs"
                                 variant="outline"
                                 onClick={() =>
-                                  updateSettings(
-                                    patchCustomModels(
-                                      provider,
-                                      [...getDefaultCustomModelsForProvider(defaults, provider)],
-                                    ),
-                                  )
-                                }
-                              >
+                                    updateSettings(
+                                      patchCustomModelsForProvider(provider, [
+                                        ...getCustomModelsForProvider(defaults, provider),
+                                      ]),
+                                    )
+                                  }
+                                >
                                 Reset custom models
                               </Button>
                             ) : null}

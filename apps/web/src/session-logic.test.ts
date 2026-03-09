@@ -220,6 +220,44 @@ describe("derivePendingUserInputs", () => {
       },
     ]);
   });
+
+  it("keeps freeform-only prompts pending when no preset options are provided", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "user-input-freeform",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        tone: "info",
+        payload: {
+          requestId: "req-user-input-freeform",
+          questions: [
+            {
+              id: "response",
+              header: "Agent input required",
+              question: "Why should we take this path?",
+              options: [],
+            },
+          ],
+        },
+      }),
+    ];
+
+    expect(derivePendingUserInputs(activities)).toEqual([
+      {
+        requestId: "req-user-input-freeform",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        questions: [
+          {
+            id: "response",
+            header: "Agent input required",
+            question: "Why should we take this path?",
+            options: [],
+          },
+        ],
+      },
+    ]);
+  });
 });
 
 describe("deriveActivePlanState", () => {
@@ -642,12 +680,19 @@ describe("deriveActiveWorkStartedAt", () => {
 describe("PROVIDER_OPTIONS", () => {
   it("keeps Claude Code and Cursor visible as unavailable placeholders in the stack base", () => {
     const claude = PROVIDER_OPTIONS.find((option) => option.value === "claudeCode");
+    const copilot = PROVIDER_OPTIONS.find((option) => option.value === "copilot");
     const cursor = PROVIDER_OPTIONS.find((option) => option.value === "cursor");
     expect(PROVIDER_OPTIONS).toEqual([
       { value: "codex", label: "Codex", available: true },
+      { value: "copilot", label: "Copilot", available: true },
       { value: "claudeCode", label: "Claude Code", available: false },
       { value: "cursor", label: "Cursor", available: false },
     ]);
+    expect(copilot).toEqual({
+      value: "copilot",
+      label: "Copilot",
+      available: true,
+    });
     expect(claude).toEqual({
       value: "claudeCode",
       label: "Claude Code",

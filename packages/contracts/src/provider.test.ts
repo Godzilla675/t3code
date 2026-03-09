@@ -34,6 +34,32 @@ describe("ProviderSessionStartInput", () => {
     expect(parsed.providerOptions?.codex?.homePath).toBe("/tmp/.codex");
   });
 
+  it("accepts copilot-compatible payloads", () => {
+    const parsed = decodeProviderSessionStartInput({
+      threadId: "thread-1",
+      provider: "copilot",
+      cwd: "/tmp/workspace",
+      model: "gpt-5",
+      activeTurnId: "turn-1",
+      modelOptions: {
+        copilot: {},
+      },
+      runtimeMode: "full-access",
+      providerOptions: {
+        copilot: {
+          cliUrl: "http://127.0.0.1:4242/jsonrpc",
+          configDir: "/tmp/.config/github-copilot",
+        },
+      },
+    });
+
+    expect(parsed.provider).toBe("copilot");
+    expect(parsed.modelOptions?.copilot).toEqual({});
+    expect(parsed.activeTurnId).toBe("turn-1");
+    expect(parsed.providerOptions?.copilot?.cliUrl).toBe("http://127.0.0.1:4242/jsonrpc");
+    expect(parsed.providerOptions?.copilot?.configDir).toBe("/tmp/.config/github-copilot");
+  });
+
   it("rejects payloads without runtime mode", () => {
     expect(() =>
       decodeProviderSessionStartInput({
@@ -60,5 +86,18 @@ describe("ProviderSendTurnInput", () => {
     expect(parsed.model).toBe("gpt-5.3-codex");
     expect(parsed.modelOptions?.codex?.reasoningEffort).toBe("xhigh");
     expect(parsed.modelOptions?.codex?.fastMode).toBe(true);
+  });
+
+  it("accepts copilot-scoped model options", () => {
+    const parsed = decodeProviderSendTurnInput({
+      threadId: "thread-1",
+      model: "gpt-5",
+      modelOptions: {
+        copilot: {},
+      },
+    });
+
+    expect(parsed.model).toBe("gpt-5");
+    expect(parsed.modelOptions?.copilot).toEqual({});
   });
 });

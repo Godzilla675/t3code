@@ -9,6 +9,7 @@ import {
   type OrchestrationSession,
   ThreadId,
   type ProviderSession,
+  type ProviderStartOptions,
   type RuntimeMode,
   type TurnId,
 } from "@t3tools/contracts";
@@ -17,6 +18,11 @@ import { Cache, Cause, Duration, Effect, Layer, Option, Queue, Schema, Stream } 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { GitCore } from "../../git/Services/GitCore.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
+import {
+  providerStartOptionsEqual,
+  readPersistedProviderStartOptions,
+} from "../../provider/providerStartOptions.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { TextGeneration } from "../../git/Services/TextGeneration.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
@@ -129,6 +135,7 @@ function buildGeneratedWorktreeBranchName(raw: string): string {
 const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const providerService = yield* ProviderService;
+  const providerSessionDirectory = yield* ProviderSessionDirectory;
   const git = yield* GitCore;
   const textGeneration = yield* TextGeneration;
   const handledTurnStartKeys = yield* Cache.make<string, true>({
@@ -200,6 +207,7 @@ const make = Effect.gen(function* () {
     createdAt: string,
     options?: {
       readonly provider?: ProviderKind;
+      readonly providerOptions?: ProviderStartOptions;
       readonly model?: string;
       readonly modelOptions?: ProviderModelOptions;
       readonly serviceTier?: ProviderServiceTier | null;
@@ -213,7 +221,9 @@ const make = Effect.gen(function* () {
 
     const desiredRuntimeMode = thread.runtimeMode;
     const currentProvider: ProviderKind | undefined =
-      thread.session?.providerName === "codex" ? thread.session.providerName : undefined;
+      thread.session?.providerName === "codex" || thread.session?.providerName === "copilot"
+        ? thread.session.providerName
+        : undefined;
     const preferredProvider: ProviderKind | undefined = options?.provider ?? currentProvider;
     const desiredModel = options?.model ?? thread.model;
     const effectiveCwd = resolveThreadWorkspaceCwd({
@@ -229,12 +239,15 @@ const make = Effect.gen(function* () {
     const startProviderSession = (input?: {
       readonly resumeCursor?: unknown;
       readonly provider?: ProviderKind;
-    }) =>
-      providerService.startSession(threadId, {
+      readonly providerOptions?: ProviderStartOptions;
+    }) => {
+      const providerOptions = input?.providerOptions ?? options?.providerOptions;
+      return providerService.startSession(threadId, {
         threadId,
         ...(input?.provider ?? preferredProvider
           ? { provider: input?.provider ?? preferredProvider }
           : {}),
+        ...(providerOptions !== undefined ? { providerOptions } : {}),
         ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
         ...(desiredModel ? { model: desiredModel } : {}),
         ...(options?.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
@@ -242,6 +255,7 @@ const make = Effect.gen(function* () {
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
         runtimeMode: desiredRuntimeMode,
       });
+    };
 
     const bindSessionToThread = (session: ProviderSession) =>
       setThreadSession({
@@ -265,6 +279,9 @@ const make = Effect.gen(function* () {
       const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
       const providerChanged = options?.provider !== undefined && options.provider !== currentProvider;
       const activeSession = yield* resolveActiveSession(existingSessionThreadId);
+      const binding = yield* providerSessionDirectory
+        .getBinding(existingSessionThreadId)
+        .pipe(Effect.map(Option.getOrUndefined));
       const sessionModelSwitch =
         currentProvider === undefined
           ? "in-session"
@@ -273,15 +290,22 @@ const make = Effect.gen(function* () {
         options?.model !== undefined && options.model !== activeSession?.model;
       const shouldRestartForModelChange =
         modelChanged && sessionModelSwitch === "restart-session";
+      const persistedProviderOptions = readPersistedProviderStartOptions(binding?.runtimePayload);
+      const providerOptionsChanged =
+        options?.providerOptions !== undefined &&
+        !providerStartOptionsEqual(
+          persistedProviderOptions,
+          options.providerOptions,
+        );
 
-      if (!runtimeModeChanged && !providerChanged && !shouldRestartForModelChange) {
+      if (!runtimeModeChanged && !providerChanged && !shouldRestartForModelChange && !providerOptionsChanged) {
         return existingSessionThreadId;
       }
 
       const resumeCursor =
         providerChanged || shouldRestartForModelChange
           ? undefined
-          : (activeSession?.resumeCursor ?? undefined);
+          : (activeSession?.resumeCursor ?? binding?.resumeCursor ?? undefined);
       yield* Effect.logInfo("provider command reactor restarting provider session", {
         threadId,
         existingSessionThreadId,
@@ -293,12 +317,33 @@ const make = Effect.gen(function* () {
         providerChanged,
         modelChanged,
         shouldRestartForModelChange,
+        providerOptionsChanged,
         hasResumeCursor: resumeCursor !== undefined,
       });
+      const restartProviderOptions =
+        options?.providerOptions ?? (!providerChanged ? persistedProviderOptions : undefined);
       const restartedSession = yield* startProviderSession({
         ...(resumeCursor !== undefined ? { resumeCursor } : {}),
         ...(options?.provider !== undefined ? { provider: options.provider } : {}),
+        ...(restartProviderOptions !== undefined ? { providerOptions: restartProviderOptions } : {}),
       });
+      if (providerChanged && currentProvider !== undefined) {
+        yield* providerService
+          .stopSessionForProvider({
+            threadId: existingSessionThreadId,
+            provider: currentProvider,
+          })
+          .pipe(
+            Effect.catch((cause: unknown) =>
+              Effect.logWarning("provider command reactor failed to stop previous provider session", {
+                threadId,
+                previousProvider: currentProvider,
+                nextProvider: restartedSession.provider,
+                cause,
+              }),
+            ),
+          );
+      }
       yield* Effect.logInfo("provider command reactor restarted provider session", {
         threadId,
         previousSessionId: existingSessionThreadId,
@@ -322,6 +367,7 @@ const make = Effect.gen(function* () {
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly provider?: ProviderKind;
+    readonly providerOptions?: ProviderStartOptions;
     readonly model?: string;
     readonly serviceTier?: ProviderServiceTier | null;
     readonly modelOptions?: ProviderModelOptions;
@@ -334,6 +380,7 @@ const make = Effect.gen(function* () {
     }
     yield* ensureSessionForThread(input.threadId, input.createdAt, {
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
+      ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
       ...(input.modelOptions !== undefined ? { modelOptions: input.modelOptions } : {}),
@@ -469,6 +516,9 @@ const make = Effect.gen(function* () {
       messageText: message.text,
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(event.payload.provider !== undefined ? { provider: event.payload.provider } : {}),
+      ...(event.payload.providerOptions !== undefined
+        ? { providerOptions: event.payload.providerOptions }
+        : {}),
       ...(event.payload.model !== undefined ? { model: event.payload.model } : {}),
       ...(event.payload.serviceTier !== undefined ? { serviceTier: event.payload.serviceTier } : {}),
       ...(event.payload.modelOptions !== undefined ? { modelOptions: event.payload.modelOptions } : {}),

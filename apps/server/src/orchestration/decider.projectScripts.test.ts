@@ -160,6 +160,12 @@ describe("decider project scripts", () => {
             attachments: [],
           },
           provider: "codex",
+          providerOptions: {
+            codex: {
+              binaryPath: "/usr/local/bin/codex",
+              homePath: "/tmp/codex-home",
+            },
+          },
           model: "gpt-5.3-codex",
           modelOptions: {
             codex: {
@@ -190,6 +196,12 @@ describe("decider project scripts", () => {
       threadId: ThreadId.makeUnsafe("thread-1"),
       messageId: asMessageId("message-user-1"),
       provider: "codex",
+      providerOptions: {
+        codex: {
+          binaryPath: "/usr/local/bin/codex",
+          homePath: "/tmp/codex-home",
+        },
+      },
       model: "gpt-5.3-codex",
       modelOptions: {
         codex: {

@@ -78,6 +78,14 @@ export interface ProviderServiceShape {
   ) => Effect.Effect<void, ProviderServiceError>;
 
   /**
+   * Stop a specific provider-owned session without consulting the persisted binding.
+   */
+  readonly stopSessionForProvider: (input: {
+    readonly threadId: ThreadId;
+    readonly provider: ProviderKind;
+  }) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
    * List active provider sessions.
    *
    * Aggregates runtime session lists from all registered adapters.
@@ -90,6 +98,11 @@ export interface ProviderServiceShape {
   readonly getCapabilities: (
     provider: ProviderKind,
   ) => Effect.Effect<ProviderAdapterCapabilities, ProviderServiceError>;
+
+  /**
+   * Reconcile persisted provider runtime state during server startup.
+   */
+  readonly reconcilePersistedSessions: () => Effect.Effect<void>;
 
   /**
    * Roll back provider conversation state by a number of turns.

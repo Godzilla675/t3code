@@ -1,5 +1,6 @@
 import {
   type ApprovalRequestId,
+  DEFAULT_PROVIDER_KIND,
   DEFAULT_MODEL_BY_PROVIDER,
   EDITORS,
   type EditorId,
@@ -165,6 +166,7 @@ import {
   ClaudeAI,
   CursorIcon,
   Gemini,
+  GitHubIcon,
   Icon,
   OpenAI,
   OpenCodeIcon,
@@ -199,7 +201,11 @@ import { SidebarTrigger } from "./ui/sidebar";
 import { newCommandId, newMessageId, newThreadId } from "~/lib/utils";
 import { readNativeApi } from "~/nativeApi";
 import {
+  type AppSettings,
+  getCustomModelsForProvider,
   getAppModelOptions,
+  getProviderStartOptions,
+  inferProviderForAppModel,
   resolveAppModelSelection,
   resolveAppServiceTier,
   shouldShowFastTierIcon,
@@ -795,15 +801,32 @@ export default function ChatView({ threadId }: ChatViewProps) {
   );
   const selectedServiceTierSetting = settings.codexServiceTier;
   const selectedServiceTier = resolveAppServiceTier(selectedServiceTierSetting);
+  const inferredProviderFromModel = useMemo(
+    () => inferProviderForAppModel(settings, activeThread?.model ?? activeProject?.model ?? null),
+    [activeProject?.model, activeThread?.model, settings],
+  );
+  const selectedProviderByThreadIdIfAvailable =
+    selectedProviderByThreadId &&
+    PROVIDER_OPTIONS.some(
+      (option) => option.value === selectedProviderByThreadId && option.available,
+    )
+      ? selectedProviderByThreadId
+      : null;
+  const inferredProviderIfAvailable = PROVIDER_OPTIONS.some(
+    (option) => option.value === inferredProviderFromModel && option.available,
+  )
+    ? inferredProviderFromModel
+    : DEFAULT_PROVIDER_KIND;
   const lockedProvider: ProviderKind | null = hasThreadStarted
-    ? (sessionProvider ?? selectedProviderByThreadId ?? null)
+    ? (sessionProvider ?? selectedProviderByThreadIdIfAvailable ?? inferredProviderIfAvailable)
     : null;
-  const selectedProvider: ProviderKind = lockedProvider ?? selectedProviderByThreadId ?? "codex";
+  const selectedProvider: ProviderKind =
+    lockedProvider ?? selectedProviderByThreadIdIfAvailable ?? inferredProviderIfAvailable;
   const baseThreadModel = resolveModelSlugForProvider(
     selectedProvider,
     activeThread?.model ?? activeProject?.model ?? getDefaultModel(selectedProvider),
   );
-  const customModelsForSelectedProvider = settings.customCodexModels;
+  const customModelsForSelectedProvider = getCustomModelsForProvider(settings, selectedProvider);
   const selectedModel = useMemo(() => {
     const draftModel = composerDraft.model;
     if (!draftModel) {
@@ -830,6 +853,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
     };
     return Object.keys(codexOptions).length > 0 ? { codex: codexOptions } : undefined;
   }, [selectedCodexFastModeEnabled, selectedEffort, selectedProvider, supportsReasoningEffort]);
+  const selectedProviderStartOptions = useMemo(
+    () => getProviderStartOptions(settings, selectedProvider),
+    [selectedProvider, settings],
+  );
   const selectedModelForPicker = selectedModel;
   const modelOptionsByProvider = useMemo(
     () => getCustomModelOptionsByProvider(settings),
@@ -1273,7 +1300,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const keybindings = serverConfigQuery.data?.keybindings ?? EMPTY_KEYBINDINGS;
   const availableEditors = serverConfigQuery.data?.availableEditors ?? EMPTY_AVAILABLE_EDITORS;
   const providerStatuses = serverConfigQuery.data?.providers ?? EMPTY_PROVIDER_STATUSES;
-  const activeProvider = activeThread?.session?.provider ?? "codex";
+  const activeProvider = activeThread?.session?.provider ?? selectedProvider;
   const activeProviderStatus = useMemo(
     () => providerStatuses.find((status) => status.provider === activeProvider) ?? null,
     [activeProvider, providerStatuses],
@@ -2253,6 +2280,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
 
   const addComposerImages = (files: File[]) => {
     if (!activeThreadId || files.length === 0) return;
+    if (selectedProvider === "copilot") {
+      setThreadError(activeThreadId, "Copilot does not yet support image attachments.");
+      return;
+    }
 
     const nextImages: ComposerImageAttachment[] = [];
     let nextImageCount = composerImagesRef.current.length;
@@ -2432,6 +2463,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
       return;
     }
     if (!trimmed && composerImages.length === 0) return;
+    if (selectedProvider === "copilot" && composerImages.length > 0) {
+      setThreadError(activeThread.id, "Copilot does not yet support image attachments.");
+      return;
+    }
     if (!activeProject) return;
     const threadIdForSend = activeThread.id;
     const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
@@ -2627,6 +2662,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           ? { modelOptions: selectedModelOptionsForDispatch }
           : {}),
         provider: selectedProvider,
+        providerOptions: selectedProviderStartOptions,
         assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
         runtimeMode,
         interactionMode,
@@ -2899,6 +2935,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
             attachments: [],
           },
           provider: selectedProvider,
+          providerOptions: selectedProviderStartOptions,
           model: selectedModel || undefined,
           ...(selectedModelOptionsForDispatch
             ? { modelOptions: selectedModelOptionsForDispatch }
@@ -2933,6 +2970,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
       runtimeMode,
       selectedModel,
       selectedModelOptionsForDispatch,
+      selectedProviderStartOptions,
       selectedProvider,
       setComposerDraftInteractionMode,
       setThreadError,
@@ -2999,6 +3037,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
             attachments: [],
           },
           provider: selectedProvider,
+          providerOptions: selectedProviderStartOptions,
           model: selectedModel || undefined,
           ...(selectedModelOptionsForDispatch
             ? { modelOptions: selectedModelOptionsForDispatch }
@@ -3052,6 +3091,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
     runtimeMode,
     selectedModel,
     selectedModelOptionsForDispatch,
+    selectedProviderStartOptions,
     selectedProvider,
     settings.enableAssistantStreaming,
     syncServerReadModel,
@@ -3067,7 +3107,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
       setComposerDraftProvider(activeThread.id, provider);
       setComposerDraftModel(
         activeThread.id,
-        resolveAppModelSelection(provider, settings.customCodexModels, model),
+        resolveAppModelSelection(provider, getCustomModelsForProvider(settings, provider), model),
       );
       scheduleComposerFocus();
     },
@@ -3077,7 +3117,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
       scheduleComposerFocus,
       setComposerDraftModel,
       setComposerDraftProvider,
-      settings.customCodexModels,
+      settings,
     ],
   );
   const onEffortSelect = useCallback(
@@ -3600,11 +3640,15 @@ export default function ChatView({ threadId }: ChatViewProps) {
                   isComposerApprovalState
                     ? (activePendingApproval?.detail ?? "Resolve this approval request to continue")
                     : activePendingProgress
-                    ? "Type your own answer, or leave this blank to use the selected option"
+                    ? activePendingProgress.activeQuestion?.options.length
+                      ? "Type your own answer, or leave this blank to use the selected option"
+                      : "Type your answer"
                     : showPlanFollowUpPrompt && activeProposedPlan
                       ? "Add feedback to refine the plan, or leave this blank to implement it"
                       : phase === "disconnected"
-                        ? "Ask for follow-up changes or attach images"
+                        ? selectedProvider === "copilot"
+                          ? "Ask for follow-up changes"
+                          : "Ask for follow-up changes or attach images"
                         : "Ask anything, @tag files/folders, or use /model"
                 }
                 disabled={isConnecting || isComposerApprovalState}
@@ -5295,16 +5339,18 @@ const COMING_SOON_PROVIDER_OPTIONS = [
   { id: "gemini", label: "Gemini", icon: Gemini },
 ] as const;
 
-function getCustomModelOptionsByProvider(settings: {
-  customCodexModels: readonly string[];
-}): Record<ProviderKind, ReadonlyArray<{ slug: string; name: string }>> {
+function getCustomModelOptionsByProvider(
+  settings: Pick<AppSettings, "customCodexModels" | "customCopilotModels">,
+): Record<ProviderKind, ReadonlyArray<{ slug: string; name: string }>> {
   return {
-    codex: getAppModelOptions("codex", settings.customCodexModels),
+    codex: getAppModelOptions("codex", getCustomModelsForProvider(settings, "codex")),
+    copilot: getAppModelOptions("copilot", getCustomModelsForProvider(settings, "copilot")),
   };
 }
 
 const PROVIDER_ICON_BY_PROVIDER: Record<ProviderPickerKind, Icon> = {
   codex: OpenAI,
+  copilot: GitHubIcon,
   claudeCode: ClaudeAI,
   cursor: CursorIcon,
 };

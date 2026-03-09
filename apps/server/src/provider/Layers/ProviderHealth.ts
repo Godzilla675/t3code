@@ -8,10 +8,13 @@
  *
  * @module ProviderHealthLive
  */
-import type {
-  ServerProviderAuthStatus,
-  ServerProviderStatus,
-  ServerProviderStatusState,
+import {
+  CODEX_REASONING_EFFORT_OPTIONS,
+  type CodexReasoningEffort,
+  type ModelOption,
+  type ServerProviderAuthStatus,
+  type ServerProviderStatus,
+  type ServerProviderStatusState,
 } from "@t3tools/contracts";
 import { Effect, Layer, Option, Result, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -41,6 +44,10 @@ function nonEmptyTrimmed(value: string | undefined): string | undefined {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
+
+const REASONING_EFFORT_VALUES = new Set<CodexReasoningEffort>(
+  CODEX_REASONING_EFFORT_OPTIONS as ReadonlyArray<CodexReasoningEffort>,
+);
 
 function toError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));
@@ -268,6 +275,68 @@ export interface CopilotHealthClient {
   readonly start: () => Promise<unknown>;
   readonly stop: () => Promise<unknown>;
   readonly getAuthStatus: () => Promise<unknown>;
+  readonly listModels?: () => Promise<unknown>;
+}
+
+function normalizeCopilotAvailableModels(value: unknown): ReadonlyArray<ModelOption> | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const models: ModelOption[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const record = entry as Record<string, unknown>;
+    const slug = nonEmptyTrimmed(typeof record.id === "string" ? record.id : undefined);
+    const name =
+      nonEmptyTrimmed(typeof record.name === "string" ? record.name : undefined) ?? slug;
+    const capabilities =
+      record.capabilities !== null && typeof record.capabilities === "object"
+        ? (record.capabilities as Record<string, unknown>)
+        : undefined;
+    const supports =
+      capabilities?.supports !== null && typeof capabilities?.supports === "object"
+        ? (capabilities.supports as Record<string, unknown>)
+        : undefined;
+    const supportsVision = typeof supports?.vision === "boolean" ? supports.vision : undefined;
+    const supportsReasoningEffort = supports?.reasoningEffort === true;
+    const supportedReasoningEfforts = Array.isArray(record.supportedReasoningEfforts)
+      ? record.supportedReasoningEfforts.filter(
+          (candidate): candidate is CodexReasoningEffort =>
+            typeof candidate === "string" &&
+            REASONING_EFFORT_VALUES.has(candidate as CodexReasoningEffort),
+        )
+      : [];
+    const defaultReasoningEffort =
+      typeof record.defaultReasoningEffort === "string" &&
+      REASONING_EFFORT_VALUES.has(record.defaultReasoningEffort as CodexReasoningEffort)
+        ? (record.defaultReasoningEffort as CodexReasoningEffort)
+        : undefined;
+    if (!slug || !name || seen.has(slug)) {
+      continue;
+    }
+
+    seen.add(slug);
+    models.push({
+      slug,
+      name,
+      ...(supportsVision !== undefined ? { supportsVision } : {}),
+      ...(supportsReasoningEffort && supportedReasoningEfforts.length > 0
+        ? { supportedReasoningEfforts }
+        : {}),
+      ...(defaultReasoningEffort &&
+      (supportedReasoningEfforts.length === 0 ||
+        supportedReasoningEfforts.includes(defaultReasoningEffort))
+        ? { defaultReasoningEffort }
+        : {}),
+    });
+  }
+
+  return models.length > 0 ? models : undefined;
 }
 
 const makeCopilotHealthClient = async (): Promise<CopilotHealthClient> => {
@@ -390,6 +459,26 @@ const probeCopilotHealthClient = (
     }
 
     const parsed = parseCopilotAuthStatus(authProbe.success.value);
+    const availableModels =
+      parsed.authStatus === "authenticated" && typeof client.listModels === "function"
+        ? yield* Effect.tryPromise({
+            try: () => client.listModels!(),
+            catch: (cause) =>
+              toCopilotHealthProbeError(
+                "models",
+                `Could not list GitHub Copilot models: ${toError(cause).message}.`,
+                cause,
+              ),
+          }).pipe(
+            Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
+            Effect.result,
+            Effect.map((modelsProbe) =>
+              Result.isSuccess(modelsProbe) && Option.isSome(modelsProbe.success)
+                ? normalizeCopilotAvailableModels(modelsProbe.success.value)
+                : undefined,
+            ),
+          )
+        : undefined;
     return {
       provider: COPILOT_PROVIDER,
       status: parsed.status,
@@ -397,6 +486,7 @@ const probeCopilotHealthClient = (
       authStatus: parsed.authStatus,
       checkedAt,
       ...(parsed.message ? { message: parsed.message } : {}),
+      ...(availableModels ? { availableModels } : {}),
     } satisfies ServerProviderStatus;
   });
 

@@ -6,6 +6,7 @@ import {
   MODEL_SLUG_ALIASES_BY_PROVIDER,
   REASONING_EFFORT_OPTIONS_BY_PROVIDER,
   type CodexReasoningEffort,
+  type ModelOption,
   type ModelSlug,
   type ProviderKind,
 } from "@t3tools/contracts";
@@ -68,12 +69,33 @@ export function getReasoningEffortOptions(
   return REASONING_EFFORT_OPTIONS_BY_PROVIDER[provider];
 }
 
+export function getReasoningEffortOptionsForModel(
+  provider: ProviderKind,
+  model: Pick<ModelOption, "supportedReasoningEfforts"> | null | undefined,
+): ReadonlyArray<CodexReasoningEffort> {
+  const supportedReasoningEfforts = model?.supportedReasoningEfforts;
+  if (supportedReasoningEfforts && supportedReasoningEfforts.length > 0) {
+    return supportedReasoningEfforts;
+  }
+  return getReasoningEffortOptions(provider);
+}
+
 export function getDefaultReasoningEffort(provider: "codex"): CodexReasoningEffort;
 export function getDefaultReasoningEffort(provider: ProviderKind): CodexReasoningEffort | null;
 export function getDefaultReasoningEffort(
   provider: ProviderKind = "codex",
 ): CodexReasoningEffort | null {
   return DEFAULT_REASONING_EFFORT_BY_PROVIDER[provider];
+}
+
+export function getDefaultReasoningEffortForModel(
+  provider: ProviderKind,
+  model: Pick<ModelOption, "supportedReasoningEfforts" | "defaultReasoningEffort"> | null | undefined,
+): CodexReasoningEffort | null {
+  if ((model?.supportedReasoningEfforts?.length ?? 0) > 0) {
+    return model?.defaultReasoningEffort ?? model?.supportedReasoningEfforts?.[0] ?? null;
+  }
+  return getDefaultReasoningEffort(provider);
 }
 
 export { CODEX_REASONING_EFFORT_OPTIONS };

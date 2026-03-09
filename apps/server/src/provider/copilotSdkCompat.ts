@@ -1,14 +1,13 @@
-import { cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 type CopilotSdkModule = typeof import("@github/copilot-sdk");
 
-const require = createRequire(import.meta.url);
 const BUN_COMPAT_MARKER = ".ready";
 const BUN_COMPAT_CACHE_DIR_MODE = 0o700;
+const BUN_COMPAT_CACHE_VERSION = "2";
 
 let copilotSdkPromise: Promise<CopilotSdkModule> | undefined;
 
@@ -40,16 +39,32 @@ async function ensureBunCompatibleSdkDist(packageRoot: string): Promise<string> 
   const readyMarkerPath = path.join(compatRootPath, BUN_COMPAT_MARKER);
 
   try {
-    await stat(readyMarkerPath);
-    return compatDistPath;
+    const readyMarker = await readFile(readyMarkerPath, "utf8");
+    if (readyMarker.trim() === BUN_COMPAT_CACHE_VERSION) {
+      return compatDistPath;
+    }
   } catch {
     // Build the compat copy below.
   }
 
   const sourceDistPath = path.join(packageRoot, "dist");
+  const copilotCliSdkEntryUrl = pathToFileURL(
+    path.join(path.dirname(packageRoot), "copilot", "sdk", "index.js"),
+  ).href;
   await mkdir(compatCacheRoot, { recursive: true, mode: BUN_COMPAT_CACHE_DIR_MODE });
   await mkdir(compatRootPath, { recursive: true, mode: BUN_COMPAT_CACHE_DIR_MODE });
   await cp(sourceDistPath, compatDistPath, { recursive: true, force: true });
+
+  const clientModulePath = path.join(compatDistPath, "client.js");
+  const clientModuleSource = await readFile(clientModulePath, "utf8");
+  const patchedClientModuleSource = clientModuleSource.replace(
+    'import.meta.resolve("@github/copilot/sdk")',
+    JSON.stringify(copilotCliSdkEntryUrl),
+  );
+
+  if (patchedClientModuleSource !== clientModuleSource) {
+    await writeFile(clientModulePath, patchedClientModuleSource);
+  }
 
   const sessionModulePath = path.join(compatDistPath, "session.js");
   const sessionModuleSource = await readFile(sessionModulePath, "utf8");
@@ -62,17 +77,18 @@ async function ensureBunCompatibleSdkDist(packageRoot: string): Promise<string> 
     await writeFile(sessionModulePath, patchedSessionModuleSource);
   }
 
-  await writeFile(readyMarkerPath, "");
+  await writeFile(readyMarkerPath, `${BUN_COMPAT_CACHE_VERSION}\n`);
   return compatDistPath;
 }
 
-async function importCopilotSdk(): Promise<CopilotSdkModule> {
-  if (process.versions.bun === undefined) {
-    return import("@github/copilot-sdk");
-  }
+function resolveCopilotSdkPackageRoot(): string {
+  const packageEntryUrl = import.meta.resolve("@github/copilot-sdk");
+  const packageEntryPath = fileURLToPath(packageEntryUrl);
+  return path.dirname(path.dirname(packageEntryPath));
+}
 
-  const packageEntryPath = require.resolve("@github/copilot-sdk");
-  const packageRoot = path.dirname(path.dirname(packageEntryPath));
+async function importCopilotSdk(): Promise<CopilotSdkModule> {
+  const packageRoot = resolveCopilotSdkPackageRoot();
   const compatDistPath = await ensureBunCompatibleSdkDist(packageRoot);
   const compatEntryUrl = pathToFileURL(path.join(compatDistPath, "index.js")).href;
   return (await import(compatEntryUrl)) as CopilotSdkModule;

@@ -42,7 +42,9 @@ describe("ProviderSessionStartInput", () => {
       model: "gpt-5",
       activeTurnId: "turn-1",
       modelOptions: {
-        copilot: {},
+        copilot: {
+          reasoningEffort: "medium",
+        },
       },
       runtimeMode: "full-access",
       providerOptions: {
@@ -54,7 +56,7 @@ describe("ProviderSessionStartInput", () => {
     });
 
     expect(parsed.provider).toBe("copilot");
-    expect(parsed.modelOptions?.copilot).toEqual({});
+    expect(parsed.modelOptions?.copilot).toEqual({ reasoningEffort: "medium" });
     expect(parsed.activeTurnId).toBe("turn-1");
     expect(parsed.providerOptions?.copilot?.cliUrl).toBe("http://127.0.0.1:4242/jsonrpc");
     expect(parsed.providerOptions?.copilot?.configDir).toBe("/tmp/.config/github-copilot");
@@ -93,11 +95,13 @@ describe("ProviderSendTurnInput", () => {
       threadId: "thread-1",
       model: "gpt-5",
       modelOptions: {
-        copilot: {},
+        copilot: {
+          reasoningEffort: "low",
+        },
       },
     });
 
     expect(parsed.model).toBe("gpt-5");
-    expect(parsed.modelOptions?.copilot).toEqual({});
+    expect(parsed.modelOptions?.copilot).toEqual({ reasoningEffort: "low" });
   });
 });

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { Effect, Layer, Sink, Stream } from "effect";
 import * as PlatformError from "effect/PlatformError";
@@ -69,12 +70,15 @@ it.effect("returns ready when codex is installed and authenticated", () =>
     assert.strictEqual(status.authStatus, "authenticated");
   }).pipe(
     Effect.provide(
-      mockSpawnerLayer((args) => {
-        const joined = args.join(" ");
-        if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
-        if (joined === "login status") return { stdout: "Logged in\n", stderr: "", code: 0 };
-        throw new Error(`Unexpected args: ${joined}`);
-      }),
+      Layer.merge(
+        NodeServices.layer,
+        mockSpawnerLayer((args) => {
+          const joined = args.join(" ");
+          if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
+          if (joined === "login status") return { stdout: "Logged in\n", stderr: "", code: 0 };
+          throw new Error(`Unexpected args: ${joined}`);
+        }),
+      ),
     ),
   ),
 );
@@ -87,7 +91,7 @@ it.effect("returns unavailable when codex is missing", () =>
     assert.strictEqual(status.available, false);
     assert.strictEqual(status.authStatus, "unknown");
     assert.strictEqual(status.message, "Codex CLI (`codex`) is not installed or not on PATH.");
-  }).pipe(Effect.provide(failingSpawnerLayer("spawn codex ENOENT"))),
+  }).pipe(Effect.provide(Layer.merge(NodeServices.layer, failingSpawnerLayer("spawn codex ENOENT")))),
 );
 
 it.effect("returns unavailable when codex is below the minimum supported version", () =>
@@ -103,11 +107,14 @@ it.effect("returns unavailable when codex is below the minimum supported version
     );
   }).pipe(
     Effect.provide(
-      mockSpawnerLayer((args) => {
-        const joined = args.join(" ");
-        if (joined === "--version") return { stdout: "codex 0.36.0\n", stderr: "", code: 0 };
-        throw new Error(`Unexpected args: ${joined}`);
-      }),
+      Layer.merge(
+        NodeServices.layer,
+        mockSpawnerLayer((args) => {
+          const joined = args.join(" ");
+          if (joined === "--version") return { stdout: "codex 0.36.0\n", stderr: "", code: 0 };
+          throw new Error(`Unexpected args: ${joined}`);
+        }),
+      ),
     ),
   ),
 );
@@ -125,14 +132,17 @@ it.effect("returns unauthenticated when auth probe reports login required", () =
     );
   }).pipe(
     Effect.provide(
-      mockSpawnerLayer((args) => {
-        const joined = args.join(" ");
-        if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
-        if (joined === "login status") {
-          return { stdout: "", stderr: "Not logged in. Run codex login.", code: 1 };
-        }
-        throw new Error(`Unexpected args: ${joined}`);
-      }),
+      Layer.merge(
+        NodeServices.layer,
+        mockSpawnerLayer((args) => {
+          const joined = args.join(" ");
+          if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
+          if (joined === "login status") {
+            return { stdout: "", stderr: "Not logged in. Run codex login.", code: 1 };
+          }
+          throw new Error(`Unexpected args: ${joined}`);
+        }),
+      ),
     ),
   ),
 );
@@ -152,13 +162,16 @@ it.effect(
       );
     }).pipe(
       Effect.provide(
-        mockSpawnerLayer((args) => {
-          const joined = args.join(" ");
-          if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
-          if (joined === "login status")
-            return { stdout: "Not logged in\n", stderr: "", code: 1 };
-          throw new Error(`Unexpected args: ${joined}`);
-        }),
+        Layer.merge(
+          NodeServices.layer,
+          mockSpawnerLayer((args) => {
+            const joined = args.join(" ");
+            if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
+            if (joined === "login status")
+              return { stdout: "Not logged in\n", stderr: "", code: 1 };
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
       ),
     ),
 );
@@ -176,14 +189,17 @@ it.effect("returns warning when login status command is unsupported", () =>
     );
   }).pipe(
     Effect.provide(
-      mockSpawnerLayer((args) => {
-        const joined = args.join(" ");
-        if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
-        if (joined === "login status") {
-          return { stdout: "", stderr: "error: unknown command 'login'", code: 2 };
-        }
-        throw new Error(`Unexpected args: ${joined}`);
-      }),
+      Layer.merge(
+        NodeServices.layer,
+        mockSpawnerLayer((args) => {
+          const joined = args.join(" ");
+          if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
+          if (joined === "login status") {
+            return { stdout: "", stderr: "error: unknown command 'login'", code: 2 };
+          }
+          throw new Error(`Unexpected args: ${joined}`);
+        }),
+      ),
     ),
   ),
 );
@@ -195,13 +211,46 @@ it.effect("returns ready when Copilot is installed and authenticated", () =>
         start: async () => undefined,
         stop: async () => [],
         getAuthStatus: async () => ({ authenticated: true }),
+        listModels: async () => [
+          {
+            id: "claude-sonnet-4.6",
+            name: "Claude Sonnet 4.6",
+            capabilities: {
+              supports: {
+                vision: true,
+                reasoningEffort: true,
+              },
+            },
+            supportedReasoningEfforts: ["medium", "low"],
+            defaultReasoningEffort: "medium",
+          },
+          {
+            id: "gpt-5.4",
+            name: "GPT-5.4",
+            capabilities: {
+              supports: {
+                vision: false,
+              },
+            },
+          },
+        ],
       }),
     });
     assert.strictEqual(status.provider, "copilot");
     assert.strictEqual(status.status, "ready");
     assert.strictEqual(status.available, true);
     assert.strictEqual(status.authStatus, "authenticated");
-  }),
+    assert.deepStrictEqual(status.availableModels, [
+      {
+        slug: "claude-sonnet-4.6",
+        name: "Claude Sonnet 4.6",
+        supportsVision: true,
+        supportedReasoningEfforts: ["medium", "low"],
+        defaultReasoningEffort: "medium",
+      },
+      { slug: "gpt-5.4", name: "GPT-5.4", supportsVision: false },
+    ]);
+  }).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect("returns unauthenticated when Copilot auth probe reports signed out", () =>
@@ -221,7 +270,7 @@ it.effect("returns unauthenticated when Copilot auth probe reports signed out", 
       status.message,
       "GitHub Copilot is not authenticated. Sign in to Copilot and restart T3 Code.",
     );
-  }),
+  }).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect("returns unavailable when Copilot client fails to start", () =>
@@ -243,7 +292,7 @@ it.effect("returns unavailable when Copilot client fails to start", () =>
       status.message,
       "GitHub Copilot is unavailable. Install or repair the Copilot CLI backend and restart T3 Code.",
     );
-  }),
+  }).pipe(Effect.provide(NodeServices.layer)),
 );
 
 // ── Pure function tests ─────────────────────────────────────────────

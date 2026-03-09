@@ -186,9 +186,9 @@ it.effect("accepts provider-scoped model options in thread.turn.start", () =>
   }),
 );
 
-it.effect("accepts copilot provider selections in thread.turn.start", () =>
-  Effect.gen(function* () {
-    const parsed = yield* decodeThreadTurnStartCommand({
+  it.effect("accepts copilot provider selections in thread.turn.start", () =>
+    Effect.gen(function* () {
+      const parsed = yield* decodeThreadTurnStartCommand({
       type: "thread.turn.start",
       commandId: "cmd-turn-copilot",
       threadId: "thread-1",
@@ -198,17 +198,19 @@ it.effect("accepts copilot provider selections in thread.turn.start", () =>
         text: "hello",
         attachments: [],
       },
-      provider: "copilot",
-      model: "gpt-5",
-      modelOptions: {
-        copilot: {},
-      },
-      createdAt: "2026-01-01T00:00:00.000Z",
-    });
-    assert.strictEqual(parsed.provider, "copilot");
-    assert.deepStrictEqual(parsed.modelOptions?.copilot, {});
-  }),
-);
+        provider: "copilot",
+        model: "gpt-5",
+        modelOptions: {
+          copilot: {
+            reasoningEffort: "medium",
+          },
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      assert.strictEqual(parsed.provider, "copilot");
+      assert.deepStrictEqual(parsed.modelOptions?.copilot, { reasoningEffort: "medium" });
+    }),
+  );
 
 it.effect("accepts provider runtime options in thread.turn.start", () =>
   Effect.gen(function* () {

@@ -1,6 +1,8 @@
 import { useCallback, useSyncExternalStore } from "react";
 import { Option, Schema } from "effect";
 import {
+  type CodexReasoningEffort,
+  type ModelOption,
   type ProviderKind,
   type ProviderServiceTier,
   type ProviderStartOptions,
@@ -70,7 +72,12 @@ export interface AppModelOption {
   slug: string;
   name: string;
   isCustom: boolean;
+  supportsVision?: boolean;
+  supportedReasoningEfforts?: ReadonlyArray<CodexReasoningEffort>;
+  defaultReasoningEffort?: CodexReasoningEffort;
 }
+
+type RuntimeModelOption = Omit<ModelOption, never>;
 
 function normalizeOptionalProviderSetting(value: string): string | undefined {
   const trimmed = value.trim();
@@ -220,12 +227,29 @@ export function getAppModelOptions(
   provider: ProviderKind,
   customModels: readonly string[],
   selectedModel?: string | null,
+  runtimeModels: readonly RuntimeModelOption[] = [],
 ): AppModelOption[] {
-  const options: AppModelOption[] = getModelOptions(provider).map(({ slug, name }) => ({
-    slug,
-    name,
-    isCustom: false,
-  }));
+  const baseModels: readonly RuntimeModelOption[] =
+    runtimeModels.length > 0 ? runtimeModels : getModelOptions(provider);
+  const options: AppModelOption[] = baseModels.map(
+    ({ slug, name, supportsVision, supportedReasoningEfforts, defaultReasoningEffort }) => {
+      const option: AppModelOption = {
+        slug,
+        name,
+        isCustom: false,
+      };
+      if (supportsVision !== undefined) {
+        option.supportsVision = supportsVision;
+      }
+      if (supportedReasoningEfforts) {
+        option.supportedReasoningEfforts = supportedReasoningEfforts;
+      }
+      if (defaultReasoningEffort) {
+        option.defaultReasoningEffort = defaultReasoningEffort;
+      }
+      return option;
+    },
+  );
   const seen = new Set(options.map((option) => option.slug));
 
   for (const slug of normalizeCustomModelSlugs(customModels, provider)) {
@@ -257,8 +281,9 @@ export function resolveAppModelSelection(
   provider: ProviderKind,
   customModels: readonly string[],
   selectedModel: string | null | undefined,
+  runtimeModels: readonly RuntimeModelOption[] = [],
 ): string {
-  const options = getAppModelOptions(provider, customModels, selectedModel);
+  const options = getAppModelOptions(provider, customModels, selectedModel, runtimeModels);
   const trimmedSelectedModel = selectedModel?.trim();
   if (trimmedSelectedModel) {
     const direct = options.find((option) => option.slug === trimmedSelectedModel);
@@ -276,13 +301,10 @@ export function resolveAppModelSelection(
 
   const normalizedSelectedModel = normalizeModelSlug(selectedModel, provider);
   if (!normalizedSelectedModel) {
-    return getDefaultModel(provider);
+    return options[0]?.slug ?? getDefaultModel(provider);
   }
 
-  return (
-    options.find((option) => option.slug === normalizedSelectedModel)?.slug ??
-    getDefaultModel(provider)
-  );
+  return options.find((option) => option.slug === normalizedSelectedModel)?.slug ?? options[0]?.slug ?? getDefaultModel(provider);
 }
 
 export function getSlashModelOptions(
@@ -290,9 +312,10 @@ export function getSlashModelOptions(
   customModels: readonly string[],
   query: string,
   selectedModel?: string | null,
+  runtimeModels: readonly RuntimeModelOption[] = [],
 ): AppModelOption[] {
   const normalizedQuery = query.trim().toLowerCase();
-  const options = getAppModelOptions(provider, customModels, selectedModel);
+  const options = getAppModelOptions(provider, customModels, selectedModel, runtimeModels);
   if (!normalizedQuery) {
     return options;
   }

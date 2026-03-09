@@ -59,6 +59,38 @@ describe("getAppModelOptions", () => {
 
     expect(options.map((option) => option.slug)).toEqual(["gpt-5", "custom/copilot-model"]);
   });
+
+  it("prefers runtime Copilot models over the static built-in fallback", () => {
+    const options = getAppModelOptions(
+      "copilot",
+      ["custom/copilot-model"],
+      undefined,
+        [
+          {
+            slug: "claude-sonnet-4.6",
+            name: "Claude Sonnet 4.6",
+            supportsVision: true,
+            supportedReasoningEfforts: ["medium", "low"],
+            defaultReasoningEffort: "medium",
+          },
+          { slug: "gpt-5.4", name: "GPT-5.4", supportsVision: false },
+        ],
+      );
+
+    expect(options.map((option) => option.slug)).toEqual([
+      "claude-sonnet-4.6",
+      "gpt-5.4",
+      "custom/copilot-model",
+    ]);
+    expect(options[0]).toMatchObject({
+      supportsVision: true,
+      supportedReasoningEfforts: ["medium", "low"],
+      defaultReasoningEffort: "medium",
+    });
+    expect(options[1]).toMatchObject({
+      supportsVision: false,
+    });
+  });
 });
 
 describe("resolveAppModelSelection", () => {
@@ -71,6 +103,20 @@ describe("resolveAppModelSelection", () => {
   it("falls back to the provider default when no model is selected", () => {
     expect(resolveAppModelSelection("codex", [], "")).toBe("gpt-5.4");
     expect(resolveAppModelSelection("copilot", [], "")).toBe("gpt-5");
+  });
+
+  it("falls back to the first runtime Copilot model when one is available", () => {
+    expect(
+      resolveAppModelSelection(
+        "copilot",
+        [],
+        "",
+        [
+          { slug: "claude-sonnet-4.6", name: "Claude Sonnet 4.6" },
+          { slug: "gpt-5.4", name: "GPT-5.4" },
+        ],
+      ),
+    ).toBe("claude-sonnet-4.6");
   });
 });
 

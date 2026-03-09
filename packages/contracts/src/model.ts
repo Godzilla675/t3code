@@ -1,16 +1,20 @@
 import { Schema } from "effect";
 import { ProviderKind } from "./orchestration";
+import { TrimmedNonEmptyString } from "./baseSchemas";
 
 export const CODEX_REASONING_EFFORT_OPTIONS = ["xhigh", "high", "medium", "low"] as const;
 export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORT_OPTIONS)[number];
+const ReasoningEffortSchema = Schema.Literals(CODEX_REASONING_EFFORT_OPTIONS);
 
 export const CodexModelOptions = Schema.Struct({
-  reasoningEffort: Schema.optional(Schema.Literals(CODEX_REASONING_EFFORT_OPTIONS)),
+  reasoningEffort: Schema.optional(ReasoningEffortSchema),
   fastMode: Schema.optional(Schema.Boolean),
 });
 export type CodexModelOptions = typeof CodexModelOptions.Type;
 
-export const CopilotModelOptions = Schema.Struct({});
+export const CopilotModelOptions = Schema.Struct({
+  reasoningEffort: Schema.optional(ReasoningEffortSchema),
+});
 export type CopilotModelOptions = typeof CopilotModelOptions.Type;
 
 export const ProviderModelOptions = Schema.Struct({
@@ -19,18 +23,47 @@ export const ProviderModelOptions = Schema.Struct({
 });
 export type ProviderModelOptions = typeof ProviderModelOptions.Type;
 
-type ModelOption = {
-  readonly slug: string;
-  readonly name: string;
-};
+export const ModelOption = Schema.Struct({
+  slug: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+  supportsVision: Schema.optional(Schema.Boolean),
+  supportedReasoningEfforts: Schema.optional(Schema.Array(ReasoningEffortSchema)),
+  defaultReasoningEffort: Schema.optional(ReasoningEffortSchema),
+});
+export type ModelOption = typeof ModelOption.Type;
 
 export const MODEL_OPTIONS_BY_PROVIDER = {
   codex: [
-    { slug: "gpt-5.4", name: "GPT-5.4" },
-    { slug: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
-    { slug: "gpt-5.3-codex-spark", name: "GPT-5.3 Codex Spark" },
-    { slug: "gpt-5.2-codex", name: "GPT-5.2 Codex" },
-    { slug: "gpt-5.2", name: "GPT-5.2" },
+    {
+      slug: "gpt-5.4",
+      name: "GPT-5.4",
+      supportedReasoningEfforts: CODEX_REASONING_EFFORT_OPTIONS,
+      defaultReasoningEffort: "high",
+    },
+    {
+      slug: "gpt-5.3-codex",
+      name: "GPT-5.3 Codex",
+      supportedReasoningEfforts: CODEX_REASONING_EFFORT_OPTIONS,
+      defaultReasoningEffort: "high",
+    },
+    {
+      slug: "gpt-5.3-codex-spark",
+      name: "GPT-5.3 Codex Spark",
+      supportedReasoningEfforts: CODEX_REASONING_EFFORT_OPTIONS,
+      defaultReasoningEffort: "high",
+    },
+    {
+      slug: "gpt-5.2-codex",
+      name: "GPT-5.2 Codex",
+      supportedReasoningEfforts: CODEX_REASONING_EFFORT_OPTIONS,
+      defaultReasoningEffort: "high",
+    },
+    {
+      slug: "gpt-5.2",
+      name: "GPT-5.2",
+      supportedReasoningEfforts: CODEX_REASONING_EFFORT_OPTIONS,
+      defaultReasoningEffort: "high",
+    },
   ],
   copilot: [{ slug: "gpt-5", name: "GPT-5" }],
 } as const satisfies Record<ProviderKind, readonly ModelOption[]>;

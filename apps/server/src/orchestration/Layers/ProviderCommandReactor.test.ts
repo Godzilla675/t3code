@@ -148,6 +148,12 @@ describe("ProviderCommandReactor", () => {
           ...(model !== undefined ? { model } : {}),
           ...(typeof input === "object" &&
           input !== null &&
+          "modelOptions" in input &&
+          input.modelOptions !== undefined
+            ? { modelOptions: input.modelOptions }
+            : {}),
+          ...(typeof input === "object" &&
+          input !== null &&
           "providerOptions" in input &&
           input.providerOptions !== undefined
             ? { providerOptions: input.providerOptions }
@@ -682,6 +688,77 @@ describe("ProviderCommandReactor", () => {
         copilot: {
           cliUrl: "http://127.0.0.1:9000",
           configDir: "/tmp/copilot-config-b",
+        },
+      },
+    });
+  });
+
+  it("restarts the Copilot session when reasoning effort changes", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-copilot-effort-1"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-copilot-effort-1"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        provider: "copilot",
+        model: "gpt-5.4",
+        modelOptions: {
+          copilot: {
+            reasoningEffort: "high",
+          },
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-copilot-effort-2"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-copilot-effort-2"),
+          role: "user",
+          text: "second",
+          attachments: [],
+        },
+        provider: "copilot",
+        model: "gpt-5.4",
+        modelOptions: {
+          copilot: {
+            reasoningEffort: "low",
+          },
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+    expect(harness.stopSession.mock.calls.length).toBe(0);
+    expect(harness.startSession.mock.calls[1]?.[1]).toMatchObject({
+      provider: "copilot",
+      model: "gpt-5.4",
+      resumeCursor: { opaque: "cursor-1" },
+      modelOptions: {
+        copilot: {
+          reasoningEffort: "low",
         },
       },
     });

@@ -129,7 +129,11 @@ interface ComposerDraftStoreState {
     threadId: ThreadId,
     interactionMode: ProviderInteractionMode | null | undefined,
   ) => void;
-  setEffort: (threadId: ThreadId, effort: CodexReasoningEffort | null | undefined) => void;
+  setEffort: (
+    threadId: ThreadId,
+    effort: CodexReasoningEffort | null | undefined,
+    defaultEffort?: CodexReasoningEffort | null,
+  ) => void;
   setCodexFastMode: (threadId: ThreadId, enabled: boolean | null | undefined) => void;
   addImage: (threadId: ThreadId, image: ComposerImageAttachment) => void;
   addImages: (threadId: ThreadId, images: ComposerImageAttachment[]) => void;
@@ -888,14 +892,14 @@ export const useComposerDraftStore = create<ComposerDraftStoreState>()(
           return { draftsByThreadId: nextDraftsByThreadId };
         });
       },
-      setEffort: (threadId, effort) => {
+      setEffort: (threadId, effort, defaultEffort = DEFAULT_REASONING_EFFORT_BY_PROVIDER.codex) => {
         if (threadId.length === 0) {
           return;
         }
         const nextEffort =
           effort &&
           REASONING_EFFORT_VALUES.has(effort) &&
-          effort !== DEFAULT_REASONING_EFFORT_BY_PROVIDER.codex
+          effort !== defaultEffort
             ? effort
             : null;
         set((state) => {

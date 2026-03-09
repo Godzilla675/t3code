@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import {
   EventId,
   NonNegativeInt,
+  type ProviderModelOptions,
   RuntimeRequestId,
   ThreadId,
   ProviderInterruptTurnInput,
@@ -30,6 +31,7 @@ import {
 import { Effect, Layer, Option, PubSub, Queue, Schema, SchemaIssue, Stream } from "effect";
 
 import { ProviderValidationError } from "../Errors.ts";
+import { readPersistedProviderModelOptions } from "../providerModelOptions.ts";
 import { readPersistedProviderStartOptions } from "../providerStartOptions.ts";
 import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
@@ -119,6 +121,7 @@ function toRuntimeStatus(session: ProviderSession): "starting" | "running" | "st
 function toRuntimePayloadFromSession(
   session: ProviderSession,
   options?: {
+    readonly modelOptions?: ProviderModelOptions;
     readonly providerOptions?: ProviderStartOptions;
   },
 ): Record<string, unknown> {
@@ -129,6 +132,7 @@ function toRuntimePayloadFromSession(
     lastError: session.lastError ?? null,
     [PENDING_APPROVAL_REQUESTS_KEY]: [],
     [PENDING_USER_INPUT_REQUESTS_KEY]: [],
+    modelOptions: options?.modelOptions ?? null,
     ...(options?.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
   };
 }
@@ -576,6 +580,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
       session: ProviderSession,
       threadId: ThreadId,
       options?: {
+        readonly modelOptions?: ProviderModelOptions;
         readonly providerOptions?: ProviderStartOptions;
       },
     ) =>
@@ -660,12 +665,14 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
         const persistedModel = readPersistedModel(input.binding.runtimePayload);
         const persistedActiveTurnId = readPersistedActiveTurnId(input.binding.runtimePayload);
+        const persistedModelOptions = readPersistedProviderModelOptions(input.binding.runtimePayload);
 
         const resumed = yield* adapter.startSession({
           threadId: input.binding.threadId,
           provider: input.binding.provider,
           ...(persistedCwd ? { cwd: persistedCwd } : {}),
           ...(persistedModel ? { model: persistedModel } : {}),
+          ...(persistedModelOptions ? { modelOptions: persistedModelOptions } : {}),
           ...(persistedActiveTurnId !== undefined ? { activeTurnId: persistedActiveTurnId } : {}),
           ...(persistedProviderOptions ? { providerOptions: persistedProviderOptions } : {}),
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
@@ -841,8 +848,11 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
         yield* upsertSessionBinding(
           session,
           threadId,
-          input.providerOptions !== undefined
-            ? { providerOptions: input.providerOptions }
+          input.providerOptions !== undefined || input.modelOptions !== undefined
+            ? {
+                ...(input.modelOptions !== undefined ? { modelOptions: input.modelOptions } : {}),
+                ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
+              }
             : undefined,
         );
         yield* analytics.record("provider.session.started", {
@@ -887,6 +897,7 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
           ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
           runtimePayload: {
             ...(input.model !== undefined ? { model: input.model } : {}),
+            modelOptions: input.modelOptions ?? null,
             activeTurnId: turn.turnId,
             lastRuntimeEvent: "provider.sendTurn",
             lastRuntimeEventAt: new Date().toISOString(),

@@ -1,8 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 
 import {
+  type ChatAttachment,
+  type CodexReasoningEffort,
   EventId,
   ProviderItemId,
+  type ProviderInteractionMode,
   RuntimeItemId,
   RuntimeRequestId,
   RuntimeTaskId,
@@ -21,6 +25,8 @@ import {
 import type { PermissionRequestResult } from "@github/copilot-sdk";
 import { Effect, Layer, Queue, Schema, Stream } from "effect";
 
+import { resolveAttachmentPath as defaultResolveAttachmentPath } from "../../attachmentStore.ts";
+import { ServerConfig } from "../../config.ts";
 import { loadCopilotSdk } from "../copilotSdkCompat.ts";
 import {
   ProviderAdapterProcessError,
@@ -83,9 +89,27 @@ type CopilotMessageAttachment =
     };
 
 type CopilotSendMode = "enqueue" | "immediate";
+type CopilotSessionMode = "interactive" | "plan" | "autopilot";
+
+type CopilotPlanReadResult = {
+  exists: boolean;
+  content: string | null;
+  path: string | null;
+};
+
+interface CopilotSessionRpcLike {
+  readonly mode?: {
+    get(): Promise<{ mode: CopilotSessionMode }>;
+    set(params: { mode: CopilotSessionMode }): Promise<{ mode: CopilotSessionMode }>;
+  };
+  readonly plan?: {
+    read(): Promise<CopilotPlanReadResult>;
+  };
+}
 
 interface CopilotSessionLike {
   readonly sessionId: string;
+  readonly rpc?: CopilotSessionRpcLike;
   send(options: {
     prompt: string;
     attachments?: ReadonlyArray<CopilotMessageAttachment>;
@@ -104,6 +128,7 @@ interface CopilotClientLike {
     sessionId?: string;
     clientName?: string;
     model?: string;
+    reasoningEffort?: CodexReasoningEffort;
     configDir?: string;
     onPermissionRequest: (
       request: CopilotPermissionRequest,
@@ -121,6 +146,7 @@ interface CopilotClientLike {
     config: {
       clientName?: string;
       model?: string;
+      reasoningEffort?: CodexReasoningEffort;
       configDir?: string;
       onPermissionRequest: (
         request: CopilotPermissionRequest,
@@ -156,6 +182,11 @@ export interface CopilotAdapterLiveOptions {
   ) => CopilotClientLike | Promise<CopilotClientLike>;
   readonly now?: () => string;
   readonly generateId?: () => string;
+  readonly resolveAttachmentPath?: (input: {
+    readonly stateDir: string;
+    readonly attachment: ChatAttachment;
+  }) => string | null;
+  readonly fileExists?: (path: string) => boolean;
 }
 
 interface PendingApprovalRequest {
@@ -193,6 +224,9 @@ interface CopilotRuntimeEntry {
   providerSession: ProviderSession;
   activeTurnId: TurnId | undefined;
   activeProviderTurnId: string | undefined;
+  sessionMode: CopilotSessionMode | undefined;
+  lastPlanTurnId: TurnId | undefined;
+  lastPlanMarkdown: string | undefined;
   lastUsage: Record<string, unknown> | undefined;
 }
 
@@ -213,12 +247,16 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function asString(value: unknown): string | undefined {
+function asTrimmedString(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function asRawString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
 
 function safeJsonStringify(value: unknown): string | undefined {
@@ -317,26 +355,34 @@ function toRequestType(request: CopilotPermissionRequest): CanonicalRequestType 
 function describePermissionRequest(request: CopilotPermissionRequest): string | undefined {
   switch (request.kind) {
     case "shell":
-      return asString(request.fullCommandText) ?? asString(request.intention);
+      return asTrimmedString(request.fullCommandText) ?? asTrimmedString(request.intention);
     case "write":
-      return asString(request.fileName) ?? asString(request.intention) ?? asString(request.diff);
+      return (
+        asTrimmedString(request.fileName) ??
+        asTrimmedString(request.intention) ??
+        asTrimmedString(request.diff)
+      );
     case "read":
-      return asString(request.path) ?? asString(request.intention);
+      return asTrimmedString(request.path) ?? asTrimmedString(request.intention);
     case "mcp":
-      return asString(request.toolTitle) ?? asString(request.toolName) ?? asString(request.serverName);
+      return (
+        asTrimmedString(request.toolTitle) ??
+        asTrimmedString(request.toolName) ??
+        asTrimmedString(request.serverName)
+      );
     case "url":
-      return asString(request.url) ?? asString(request.intention);
+      return asTrimmedString(request.url) ?? asTrimmedString(request.intention);
     case "memory":
-      return asString(request.subject) ?? asString(request.fact);
+      return asTrimmedString(request.subject) ?? asTrimmedString(request.fact);
     case "custom-tool":
-      return asString(request.toolDescription) ?? asString(request.toolName);
+      return asTrimmedString(request.toolDescription) ?? asTrimmedString(request.toolName);
     default:
       return undefined;
   }
 }
 
 function inferToolItemType(toolName: string | undefined, data: Record<string, unknown>): CanonicalItemType {
-  if (asString(data.mcpServerName)) {
+  if (asTrimmedString(data.mcpServerName)) {
     return "mcp_tool_call";
   }
 
@@ -370,12 +416,12 @@ function inferToolCompletionStatus(success: unknown): RuntimeItemStatus {
 
 function extractToolResultDetail(data: Record<string, unknown>): string | undefined {
   const result = asRecord(data.result);
-  return asString(result?.detailedContent) ?? asString(result?.content);
+  return asTrimmedString(result?.detailedContent) ?? asTrimmedString(result?.content);
 }
 
 function makeUserInputQuestions(request: CopilotUserInputRequest) {
   const choiceOptions = (request.choices ?? [])
-    .map((choice) => asString(choice))
+    .map((choice) => asTrimmedString(choice))
     .filter((choice): choice is string => choice !== undefined)
     .map((choice) => ({
       label: choice,
@@ -422,7 +468,7 @@ function extractUserInputAnswer(answers: ProviderUserInputAnswers): string | und
     }
 
     const answerRecord = asRecord(value);
-    const nestedAnswer = asString(answerRecord?.answer);
+    const nestedAnswer = asTrimmedString(answerRecord?.answer);
     if (nestedAnswer) {
       return nestedAnswer;
     }
@@ -484,6 +530,16 @@ function missingSessionError(threadId: ThreadId) {
   });
 }
 
+function toCopilotSessionMode(
+  interactionMode: ProviderInteractionMode | undefined,
+): Extract<CopilotSessionMode, "interactive" | "plan"> {
+  return interactionMode === "plan" ? "plan" : "interactive";
+}
+
+function asCopilotSessionMode(value: unknown): CopilotSessionMode | undefined {
+  return value === "interactive" || value === "plan" || value === "autopilot" ? value : undefined;
+}
+
 function makeProviderSession(input: {
   readonly threadId: ThreadId;
   readonly runtimeMode: ProviderSession["runtimeMode"];
@@ -520,12 +576,15 @@ const makeCopilotClientFactory = async (
 
 const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
   Effect.gen(function* () {
+    const serverConfig = yield* Effect.service(ServerConfig);
     const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const entries = new Map<ThreadId, CopilotRuntimeEntry>();
     const clientFactory = options?.clientFactory ?? makeCopilotClientFactory;
     const now = options?.now ?? (() => new Date().toISOString());
     const generateId = options?.generateId ?? randomUUID;
     const nativeEventLogger = options?.nativeEventLogger;
+    const resolveAttachmentPath = options?.resolveAttachmentPath ?? defaultResolveAttachmentPath;
+    const fileExists = options?.fileExists ?? existsSync;
 
     const runDetached = (effect: Effect.Effect<unknown>) => {
       void Effect.runPromise(effect).catch(() => undefined);
@@ -540,6 +599,80 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           return;
         }
         yield* Queue.offerAll(runtimeEventQueue, events);
+      });
+
+    const emitCopilotPlanSnapshot = (entry: CopilotRuntimeEntry, event: CopilotSessionEvent) =>
+      Effect.gen(function* () {
+        if (event.type !== "session.plan_changed" && event.type !== "exit_plan_mode.completed") {
+          return;
+        }
+
+        const createdAt = normalizeIsoTimestamp(event.timestamp, now);
+        const raw = buildSdkRaw(event);
+        const turnId = entry.activeTurnId;
+        const providerTurnId = entry.activeProviderTurnId;
+        const eventData = event.data ?? {};
+        const fallbackPlanMarkdown = asRawString(eventData.planContent)?.trim();
+        const planReader = entry.session.rpc?.plan?.read;
+        const planResult = planReader
+          ? yield* Effect.tryPromise({
+              try: () => planReader(),
+              catch: (cause) =>
+                toRequestError("session.rpc.plan.read", "Failed to read the Copilot session plan.", cause),
+            }).pipe(
+              Effect.catch((error: unknown) =>
+                emitRuntimeEvents([
+                  {
+                    ...makeRuntimeEventBase({
+                      threadId: entry.threadId,
+                      createdAt,
+                      ...(turnId !== undefined ? { turnId } : {}),
+                      ...(providerTurnId !== undefined ? { providerTurnId } : {}),
+                      raw,
+                    }),
+                    type: "runtime.warning",
+                    payload: {
+                      message:
+                        Schema.is(ProviderAdapterRequestError)(error) && error.detail
+                          ? error.detail
+                          : "Failed to read the Copilot session plan.",
+                      detail: eventData,
+                    },
+                  },
+                ]).pipe(Effect.as<CopilotPlanReadResult | undefined>(undefined)),
+              ),
+            )
+          : undefined;
+
+        const planMarkdown = (planResult?.content ?? fallbackPlanMarkdown)?.trim();
+        if (!planMarkdown) {
+          entry.lastPlanTurnId = undefined;
+          entry.lastPlanMarkdown = undefined;
+          return;
+        }
+
+        if (entry.lastPlanTurnId === turnId && entry.lastPlanMarkdown === planMarkdown) {
+          return;
+        }
+
+        entry.lastPlanTurnId = turnId;
+        entry.lastPlanMarkdown = planMarkdown;
+
+        yield* emitRuntimeEvents([
+          {
+            ...makeRuntimeEventBase({
+              threadId: entry.threadId,
+              createdAt,
+              ...(turnId !== undefined ? { turnId } : {}),
+              ...(providerTurnId !== undefined ? { providerTurnId } : {}),
+              raw,
+            }),
+            type: "turn.proposed.completed",
+            payload: {
+              planMarkdown,
+            },
+          },
+        ]);
       });
 
     const makeRuntimeEventBase = (input: {
@@ -658,7 +791,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
 
       switch (event.type) {
         case "assistant.turn_start": {
-          const providerTurnId = asString(eventData.turnId);
+      const providerTurnId = asTrimmedString(eventData.turnId);
           if (providerTurnId) {
             entry.activeProviderTurnId = providerTurnId;
           }
@@ -686,7 +819,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "assistant.intent": {
-          const intent = asString(eventData.intent);
+          const intent = asTrimmedString(eventData.intent);
           if (!intent || activeTurnId === undefined) {
             return [];
           }
@@ -708,8 +841,8 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "assistant.reasoning_delta": {
-          const reasoningId = asString(eventData.reasoningId);
-          const delta = asString(eventData.deltaContent);
+          const reasoningId = asTrimmedString(eventData.reasoningId);
+          const delta = asRawString(eventData.deltaContent);
           if (!reasoningId || !delta) {
             return [];
           }
@@ -733,8 +866,8 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "assistant.reasoning": {
-          const reasoningId = asString(eventData.reasoningId);
-          const content = asString(eventData.content);
+          const reasoningId = asTrimmedString(eventData.reasoningId);
+          const content = asRawString(eventData.content);
           if (!reasoningId || !content) {
             return [];
           }
@@ -761,8 +894,8 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "assistant.message_delta": {
-          const messageId = asString(eventData.messageId);
-          const delta = asString(eventData.deltaContent);
+          const messageId = asTrimmedString(eventData.messageId);
+          const delta = asRawString(eventData.deltaContent);
           if (!messageId || !delta) {
             return [];
           }
@@ -786,8 +919,8 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "assistant.message": {
-          const messageId = asString(eventData.messageId);
-          const content = asString(eventData.content);
+          const messageId = asTrimmedString(eventData.messageId);
+          const content = asRawString(eventData.content);
           if (!messageId || !content) {
             return [];
           }
@@ -859,11 +992,11 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "tool.execution_start": {
-          const toolCallId = asString(eventData.toolCallId);
+          const toolCallId = asTrimmedString(eventData.toolCallId);
           if (!toolCallId) {
             return [];
           }
-          const title = asString(eventData.toolName);
+          const title = asTrimmedString(eventData.toolName);
           const itemType = inferToolItemType(title, eventData);
           const detail = safeJsonStringify(eventData.arguments);
           entry.toolCalls.set(toolCallId, {
@@ -893,8 +1026,8 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "tool.execution_progress": {
-          const toolCallId = asString(eventData.toolCallId);
-          const summary = asString(eventData.progressMessage);
+          const toolCallId = asTrimmedString(eventData.toolCallId);
+          const summary = asTrimmedString(eventData.progressMessage);
           if (!toolCallId || !summary) {
             return [];
           }
@@ -920,8 +1053,8 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "tool.execution_partial_result": {
-          const toolCallId = asString(eventData.toolCallId);
-          const partialOutput = asString(eventData.partialOutput);
+          const toolCallId = asTrimmedString(eventData.toolCallId);
+          const partialOutput = asTrimmedString(eventData.partialOutput);
           if (!toolCallId || !partialOutput) {
             return [];
           }
@@ -949,7 +1082,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "tool.execution_complete": {
-          const toolCallId = asString(eventData.toolCallId);
+          const toolCallId = asTrimmedString(eventData.toolCallId);
           if (!toolCallId) {
             return [];
           }
@@ -995,8 +1128,40 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
             },
           ];
         }
+        case "exit_plan_mode.requested": {
+          const planMarkdown = asRawString(eventData.planContent)?.trim();
+          if (!planMarkdown) {
+            return [];
+          }
+          if (entry.lastPlanTurnId === activeTurnId && entry.lastPlanMarkdown === planMarkdown) {
+            return [];
+          }
+          entry.lastPlanTurnId = activeTurnId;
+          entry.lastPlanMarkdown = planMarkdown;
+          return [
+            {
+              ...makeRuntimeEventBase({
+                threadId: entry.threadId,
+                createdAt,
+                ...(activeTurnId !== undefined ? { turnId: activeTurnId } : {}),
+                ...(activeProviderTurnId !== undefined
+                  ? { providerTurnId: activeProviderTurnId }
+                  : {}),
+                raw,
+              }),
+              type: "turn.proposed.completed",
+              payload: {
+                planMarkdown,
+              },
+            },
+          ];
+        }
+        case "session.mode_changed": {
+          entry.sessionMode = asCopilotSessionMode(eventData.newMode);
+          return [];
+        }
         case "session.warning": {
-          const message = asString(eventData.message);
+          const message = asTrimmedString(eventData.message);
           if (!message) {
             return [];
           }
@@ -1018,7 +1183,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "session.error": {
-          const message = asString(eventData.message);
+          const message = asTrimmedString(eventData.message);
           if (!message) {
             return [];
           }
@@ -1035,7 +1200,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
               type: "runtime.error",
               payload: {
                 message,
-                class: toRuntimeErrorClass(asString(eventData.errorType)),
+                class: toRuntimeErrorClass(asTrimmedString(eventData.errorType)),
                 detail: eventData,
               },
             },
@@ -1057,7 +1222,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           ];
         }
         case "session.title_changed": {
-          const title = asString(eventData.title);
+          const title = asTrimmedString(eventData.title);
           if (!title) {
             return [];
           }
@@ -1240,13 +1405,16 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           sessionId: input.threadId,
           clientName: CLIENT_NAME,
           ...(input.model !== undefined ? { model: input.model } : {}),
+          ...(input.modelOptions?.copilot?.reasoningEffort !== undefined
+            ? { reasoningEffort: input.modelOptions.copilot.reasoningEffort }
+            : {}),
           ...(configDir !== undefined ? { configDir } : {}),
           onPermissionRequest: permissionHandler,
           onUserInputRequest: userInputHandler,
           ...(input.cwd !== undefined ? { workingDirectory: input.cwd } : {}),
           streaming: true,
         };
-        const resumedSessionId = asString(input.resumeCursor);
+        const resumedSessionId = asTrimmedString(input.resumeCursor);
 
         return yield* Effect.tryPromise({
           try: () => client.start(),
@@ -1287,7 +1455,10 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 }
                 const mapped = mapSessionEvent(entry, event);
                 runDetached(
-                  writeNativeEvent(entry.threadId, event).pipe(Effect.andThen(emitRuntimeEvents(mapped))),
+                  writeNativeEvent(entry.threadId, event).pipe(
+                    Effect.andThen(emitRuntimeEvents(mapped)),
+                    Effect.andThen(emitCopilotPlanSnapshot(entry, event)),
+                  ),
                 );
               });
 
@@ -1302,6 +1473,9 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 providerSession,
                 activeTurnId: input.activeTurnId,
                 activeProviderTurnId: undefined,
+                sessionMode: undefined,
+                lastPlanTurnId: undefined,
+                lastPlanMarkdown: undefined,
                 lastUsage: undefined,
               };
               entryRef = entry;
@@ -1401,16 +1575,38 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
     const sendTurn: CopilotAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const entry = yield* requireEntry(input.threadId);
-        if ((input.attachments ?? []).length > 0) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "sendTurn",
-            issue:
-              "Copilot SDK attachments require file, directory, or selection paths; T3 image attachments are not yet supported.",
-          });
-        }
+        const copilotAttachments = yield* Effect.forEach(
+          input.attachments ?? [],
+          (attachment) =>
+            Effect.gen(function* () {
+              const attachmentPath = resolveAttachmentPath({
+                stateDir: serverConfig.stateDir,
+                attachment,
+              });
+              if (!attachmentPath) {
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "sendTurn",
+                  issue: `Attachment '${attachment.name}' could not be resolved from local storage.`,
+                });
+              }
+              if (!fileExists(attachmentPath)) {
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "sendTurn",
+                  issue: `Attachment '${attachment.name}' is missing from local storage.`,
+                });
+              }
+              return {
+                type: "file" as const,
+                path: attachmentPath,
+                displayName: attachment.name,
+              };
+            }),
+          { concurrency: 1 },
+        );
 
-        const prompt = asString(input.input);
+        const prompt = asTrimmedString(input.input);
         if (!prompt) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
@@ -1425,6 +1621,27 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
             operation: "sendTurn",
             issue: `Thread '${input.threadId}' already has an active Copilot turn.`,
           });
+        }
+
+        const desiredSessionMode = toCopilotSessionMode(input.interactionMode);
+        const modeRpc = entry.session.rpc?.mode;
+        if (desiredSessionMode === "plan" && !modeRpc?.set) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "The installed GitHub Copilot SDK does not expose plan mode session controls.",
+          });
+        }
+        if (modeRpc?.set && entry.sessionMode !== desiredSessionMode) {
+          yield* Effect.tryPromise({
+            try: () => modeRpc.set({ mode: desiredSessionMode }),
+            catch: (cause) =>
+              toRequestError(
+                "session.rpc.mode.set",
+                `Failed to switch Copilot session mode to '${desiredSessionMode}'.`,
+                cause,
+              ),
+          }).pipe(Effect.tap(() => Effect.sync(() => (entry.sessionMode = desiredSessionMode))));
         }
 
         const previousModel = entry.providerSession.model;
@@ -1470,6 +1687,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 try: () =>
                   entry.session.send({
                     prompt,
+                    ...(copilotAttachments.length > 0 ? { attachments: copilotAttachments } : {}),
                   }),
                 catch: (cause) => toRequestError("session.send", "Failed to send Copilot turn.", cause),
               }),
@@ -1669,7 +1887,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
         for (const event of events) {
           const eventData = event.data ?? {};
           if (event.type === "assistant.turn_start") {
-            const providerTurnId = asString(eventData.turnId) ?? generateId();
+            const providerTurnId = asTrimmedString(eventData.turnId) ?? generateId();
             if (currentTurn && currentTurn.items.length > 0) {
               turns.push(currentTurn);
             }

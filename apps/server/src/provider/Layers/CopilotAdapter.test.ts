@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 
 import { ApprovalRequestId, ThreadId, TurnId } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import type {
   PermissionRequest,
   PermissionRequestResult,
 } from "@github/copilot-sdk";
 import { it, vi } from "@effect/vitest";
 
-import { Effect, Fiber, Stream } from "effect";
+import { Effect, Fiber, Layer, Stream } from "effect";
 
+import { ServerConfig } from "../../config.ts";
 import { CopilotAdapter } from "../Services/CopilotAdapter.ts";
 import { makeCopilotAdapterLive } from "./CopilotAdapter.ts";
 
@@ -33,6 +35,7 @@ type FakeSessionConfig = {
   sessionId?: string;
   clientName?: string;
   model?: string;
+  reasoningEffort?: "xhigh" | "high" | "medium" | "low";
   configDir?: string;
   onPermissionRequest: (
     request: FakePermissionRequest,
@@ -53,8 +56,20 @@ type FakeSessionEvent = {
   data?: Record<string, unknown>;
 };
 
+type FakeSessionMode = "interactive" | "plan" | "autopilot";
+
 class FakeCopilotSession {
   private handlers = new Set<(event: FakeSessionEvent) => void>();
+  private sessionMode: FakeSessionMode = "interactive";
+  private planReadResult = {
+    exists: false,
+    content: null,
+    path: null,
+  } as {
+    exists: boolean;
+    content: string | null;
+    path: string | null;
+  };
 
   readonly sendImpl = vi.fn(
     async (_options: { prompt: string; attachments?: ReadonlyArray<unknown>; mode?: string }) =>
@@ -64,6 +79,21 @@ class FakeCopilotSession {
   readonly setModelImpl = vi.fn(async (_model: string) => undefined);
   readonly getMessagesImpl = vi.fn(async () => [] as ReadonlyArray<FakeSessionEvent>);
   readonly disconnectImpl = vi.fn(async () => undefined);
+  readonly getModeImpl = vi.fn(async () => ({ mode: this.sessionMode }));
+  readonly setModeImpl = vi.fn(async ({ mode }: { mode: FakeSessionMode }) => {
+    this.sessionMode = mode;
+    return { mode };
+  });
+  readonly readPlanImpl = vi.fn(async () => this.planReadResult);
+  readonly rpc = {
+    mode: {
+      get: () => this.getModeImpl(),
+      set: (params: { mode: FakeSessionMode }) => this.setModeImpl(params),
+    },
+    plan: {
+      read: () => this.readPlanImpl(),
+    },
+  };
 
   constructor(readonly sessionId: string) {}
 
@@ -98,6 +128,10 @@ class FakeCopilotSession {
     for (const handler of this.handlers) {
       handler(event);
     }
+  }
+
+  setPlanReadResult(result: { exists: boolean; content: string | null; path: string | null }) {
+    this.planReadResult = result;
   }
 }
 
@@ -152,11 +186,18 @@ class FakeCopilotClient {
 }
 
 const client = new FakeCopilotClient();
+const resolvedAttachmentPaths = new Map<string, string>();
+const existingAttachmentPaths = new Set<string>();
 
 const layer = it.layer(
   makeCopilotAdapterLive({
     clientFactory: () => client,
-  }),
+    resolveAttachmentPath: ({ attachment }) => resolvedAttachmentPaths.get(attachment.id) ?? null,
+    fileExists: (path) => existingAttachmentPaths.has(path),
+  }).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(NodeServices.layer),
+  ),
 );
 
 const drainStartupEvents = (adapter: { readonly streamEvents: Stream.Stream<unknown> }) =>
@@ -167,6 +208,8 @@ const resetSharedAdapter = () =>
     const adapter = yield* CopilotAdapter;
     yield* adapter.stopAll();
     client.reset();
+    resolvedAttachmentPaths.clear();
+    existingAttachmentPaths.clear();
     return adapter;
   });
 
@@ -180,6 +223,11 @@ layer("CopilotAdapterLive", (it) => {
         threadId: asThreadId("thread-1"),
         cwd: "/workspaces/t3code",
         model: "gpt-5",
+        modelOptions: {
+          copilot: {
+            reasoningEffort: "medium",
+          },
+        },
         runtimeMode: "approval-required",
         providerOptions: {
           copilot: {
@@ -194,6 +242,7 @@ layer("CopilotAdapterLive", (it) => {
       assert.equal(client.resumeSessionImpl.mock.calls.length, 0);
       assert.equal(client.lastCreateConfig?.sessionId, "thread-1");
       assert.equal(client.lastCreateConfig?.model, "gpt-5");
+      assert.equal(client.lastCreateConfig?.reasoningEffort, "medium");
       assert.equal(client.lastCreateConfig?.configDir, "/tmp/copilot-config");
       assert.equal(client.lastCreateConfig?.workingDirectory, "/workspaces/t3code");
       assert.equal(client.lastCreateConfig?.streaming, true);
@@ -216,12 +265,18 @@ layer("CopilotAdapterLive", (it) => {
         provider: "copilot",
         threadId: asThreadId("thread-resume"),
         resumeCursor: "copilot-session-123",
+        modelOptions: {
+          copilot: {
+            reasoningEffort: "low",
+          },
+        },
         runtimeMode: "full-access",
       });
 
       assert.equal(client.createSessionImpl.mock.calls.length, 0);
       assert.equal(client.resumeSessionImpl.mock.calls.length, 1);
       assert.equal(client.lastResumeSessionId, "copilot-session-123");
+      assert.equal(client.lastResumeConfig?.reasoningEffort, "low");
       assert.equal(session.resumeCursor, "copilot-session-123");
     }),
   );
@@ -297,6 +352,197 @@ layer("CopilotAdapterLive", (it) => {
       assert.equal(result.threadId, "thread-send");
       assert.equal(result.resumeCursor, "thread-send");
       assert.equal(typeof result.turnId, "string");
+    }),
+  );
+
+  it.effect("maps stored image attachments to Copilot file attachments", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-send-with-attachment"),
+        model: "gpt-5.4",
+        runtimeMode: "full-access",
+      });
+
+      const session = client.currentSession;
+      assert.ok(session);
+      session.sendImpl.mockClear();
+
+      resolvedAttachmentPaths.set("attachment-1", "C:\\attachments\\diagram.png");
+      existingAttachmentPaths.add("C:\\attachments\\diagram.png");
+
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-send-with-attachment"),
+        input: "Describe this diagram",
+        attachments: [
+          {
+            type: "image",
+            id: "attachment-1",
+            name: "diagram.png",
+            mimeType: "image/png",
+            sizeBytes: 128,
+          },
+        ],
+      });
+
+      assert.deepEqual(session.sendImpl.mock.calls[0]?.[0], {
+        prompt: "Describe this diagram",
+        attachments: [
+          {
+            type: "file",
+            path: "C:\\attachments\\diagram.png",
+            displayName: "diagram.png",
+          },
+        ],
+      });
+    }),
+  );
+
+  it.effect("syncs the Copilot session mode before sending plan and default turns", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-plan-mode"),
+        model: "gpt-5.4",
+        runtimeMode: "full-access",
+      });
+      yield* drainStartupEvents(adapter);
+
+      const session = client.currentSession;
+      assert.ok(session);
+      session.setModeImpl.mockClear();
+
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-plan-mode"),
+        input: "Draft an implementation plan",
+        attachments: [],
+        interactionMode: "plan",
+      });
+      session.emit({
+        id: "evt-plan-turn-end",
+        type: "assistant.turn_end",
+        data: {},
+      });
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-plan-mode"),
+        input: "Now implement it",
+        attachments: [],
+        interactionMode: "default",
+      });
+      session.emit({
+        id: "evt-default-turn-end",
+        type: "assistant.turn_end",
+        data: {},
+      });
+
+      assert.deepEqual(session.setModeImpl.mock.calls.map((call) => call[0]), [
+        { mode: "plan" },
+        { mode: "interactive" },
+      ]);
+    }),
+  );
+
+  it.effect("preserves the active turn when Copilot plan snapshots resolve after turn end", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-plan-bridge"),
+        model: "gpt-5.4",
+        runtimeMode: "full-access",
+      });
+      yield* drainStartupEvents(adapter);
+
+      const session = client.currentSession;
+      assert.ok(session);
+
+      let resolvePlanRead:
+        | ((result: { exists: boolean; content: string | null; path: string | null }) => void)
+        | undefined;
+      const planReadPromise = new Promise<{
+        exists: boolean;
+        content: string | null;
+        path: string | null;
+      }>((resolve) => {
+        resolvePlanRead = resolve;
+      });
+      session.readPlanImpl.mockImplementationOnce(() => planReadPromise);
+
+      const observedEvents: Array<{
+        type: string;
+        turnId?: string;
+        payload?: {
+          planMarkdown?: string;
+        };
+      }> = [];
+
+      let resolveProposedEvent:
+        | ((event: (typeof observedEvents)[number]) => void)
+        | undefined;
+      let rejectProposedEvent: ((error: Error) => void) | undefined;
+      const proposedEventPromise = new Promise<(typeof observedEvents)[number]>((resolve, reject) => {
+        resolveProposedEvent = resolve;
+        rejectProposedEvent = reject;
+      });
+      const timeoutHandle = setTimeout(
+        () => rejectProposedEvent?.(new Error("Timed out waiting for the Copilot proposed-plan bridge.")),
+        1_000,
+      );
+
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          const observedEvent = event as (typeof observedEvents)[number];
+          observedEvents.push(observedEvent);
+          if (observedEvent.type === "turn.proposed.completed") {
+            resolveProposedEvent?.(observedEvent);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      const result = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-plan-bridge"),
+        input: "Draft a rollout plan",
+        attachments: [],
+        interactionMode: "plan",
+      });
+
+      session.emit({
+        id: "evt-plan-changed",
+        type: "session.plan_changed",
+        data: {},
+      });
+      session.emit({
+        id: "evt-plan-turn-end",
+        type: "assistant.turn_end",
+        data: {},
+      });
+      resolvePlanRead?.({
+        exists: true,
+        content: "## Rollout plan\n\n- capture turn state\n- persist proposal",
+        path: "C:\\plan.md",
+      });
+
+      const proposedEvent = yield* Effect.promise(() =>
+        proposedEventPromise.finally(() => clearTimeout(timeoutHandle)),
+      );
+      yield* Fiber.interrupt(eventsFiber);
+
+      assert.equal(proposedEvent.type, "turn.proposed.completed");
+      assert.equal(proposedEvent.turnId, result.turnId);
+      assert.equal(
+        proposedEvent.payload?.planMarkdown,
+        "## Rollout plan\n\n- capture turn state\n- persist proposal",
+      );
+      assert.ok(
+        observedEvents.some(
+          (event) => event.type === "turn.completed" && event.turnId === result.turnId,
+        ),
+      );
     }),
   );
 
@@ -626,7 +872,7 @@ layer("CopilotAdapterLive", (it) => {
     }),
   );
 
-  it.effect("maps Copilot session events into canonical runtime events", () =>
+  it.effect("maps Copilot session events into canonical runtime events without trimming content whitespace", () =>
     Effect.gen(function* () {
       const adapter = yield* resetSharedAdapter();
 
@@ -656,7 +902,7 @@ layer("CopilotAdapterLive", (it) => {
         type: "assistant.message_delta",
         data: {
           messageId: "msg-1",
-          deltaContent: "Hello",
+          deltaContent: "Hello ",
         },
       });
       session.emit({
@@ -684,7 +930,7 @@ layer("CopilotAdapterLive", (it) => {
       assert.equal(events[1]?.type, "content.delta");
       if (events[1]?.type === "content.delta") {
         assert.equal(events[1].payload.streamKind, "assistant_text");
-        assert.equal(events[1].payload.delta, "Hello");
+        assert.equal(events[1].payload.delta, "Hello ");
       }
 
       assert.equal(events[2]?.type, "item.completed");
@@ -700,4 +946,5 @@ layer("CopilotAdapterLive", (it) => {
       }
     }),
   );
+
 });

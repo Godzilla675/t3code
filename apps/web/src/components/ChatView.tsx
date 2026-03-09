@@ -25,8 +25,8 @@ import {
 } from "@t3tools/contracts";
 import {
   getDefaultModel,
-  getDefaultReasoningEffort,
-  getReasoningEffortOptions,
+  getDefaultReasoningEffortForModel,
+  getReasoningEffortOptionsForModel,
   normalizeModelSlug,
   resolveModelSlugForProvider,
 } from "@t3tools/shared/model";
@@ -204,6 +204,7 @@ import { SidebarTrigger } from "./ui/sidebar";
 import { newCommandId, newMessageId, newThreadId } from "~/lib/utils";
 import { readNativeApi } from "~/nativeApi";
 import {
+  type AppModelOption,
   type AppSettings,
   getCustomModelsForProvider,
   getAppModelOptions,
@@ -785,9 +786,22 @@ export default function ChatView({ threadId }: ChatViewProps) {
       activeThread.messages.length > 0 ||
       activeThread.session !== null),
   );
+  const serverConfigQuery = useQuery(serverConfigQueryOptions());
+  const providerStatuses = serverConfigQuery.data?.providers ?? EMPTY_PROVIDER_STATUSES;
+  const runtimeModelOptionsByProvider = getRuntimeModelOptionsByProvider(providerStatuses);
   const inferredProviderFromModel = useMemo(
-    () => inferProviderForAppModel(settings, activeThread?.model ?? activeProject?.model ?? null),
-    [activeProject?.model, activeThread?.model, settings],
+    () => {
+      const activeModel = activeThread?.model ?? activeProject?.model ?? null;
+      const normalizedCopilotModel = normalizeModelSlug(activeModel, "copilot");
+      if (
+        normalizedCopilotModel &&
+        runtimeModelOptionsByProvider.copilot.some((option) => option.slug === normalizedCopilotModel)
+      ) {
+        return "copilot";
+      }
+      return inferProviderForAppModel(settings, activeModel);
+    },
+    [activeProject?.model, activeThread?.model, runtimeModelOptionsByProvider, settings],
   );
   const selectedProviderByThreadIdIfAvailable =
     selectedProviderByThreadId &&
@@ -806,9 +820,16 @@ export default function ChatView({ threadId }: ChatViewProps) {
     : null;
   const selectedProvider: ProviderKind =
     lockedProvider ?? selectedProviderByThreadIdIfAvailable ?? inferredProviderIfAvailable;
+  const modelOptionsByProvider = useMemo(
+    () => getCustomModelOptionsByProvider(settings, runtimeModelOptionsByProvider),
+    [runtimeModelOptionsByProvider, settings],
+  );
   const baseThreadModel = resolveModelSlugForProvider(
     selectedProvider,
-    activeThread?.model ?? activeProject?.model ?? getDefaultModel(selectedProvider),
+    activeThread?.model ??
+      activeProject?.model ??
+      modelOptionsByProvider[selectedProvider][0]?.slug ??
+      getDefaultModel(selectedProvider),
   );
   const customModelsForSelectedProvider = getCustomModelsForProvider(settings, selectedProvider);
   const selectedModel = useMemo(() => {
@@ -820,32 +841,52 @@ export default function ChatView({ threadId }: ChatViewProps) {
       selectedProvider,
       customModelsForSelectedProvider,
       draftModel,
+      runtimeModelOptionsByProvider[selectedProvider],
     ) as ModelSlug;
-  }, [baseThreadModel, composerDraft.model, customModelsForSelectedProvider, selectedProvider]);
-  const reasoningOptions = getReasoningEffortOptions(selectedProvider);
+  }, [
+    baseThreadModel,
+    composerDraft.model,
+    customModelsForSelectedProvider,
+    runtimeModelOptionsByProvider,
+    selectedProvider,
+  ]);
+  const selectedModelOption = useMemo(
+    () => modelOptionsByProvider[selectedProvider].find((option) => option.slug === selectedModel) ?? null,
+    [modelOptionsByProvider, selectedModel, selectedProvider],
+  );
+  const reasoningOptions = getReasoningEffortOptionsForModel(selectedProvider, selectedModelOption);
   const supportsReasoningEffort = reasoningOptions.length > 0;
-  const selectedEffort = composerDraft.effort ?? getDefaultReasoningEffort(selectedProvider);
+  const selectedModelSupportsImages =
+    selectedProvider !== "copilot" || selectedModelOption?.supportsVision !== false;
+  const defaultReasoningEffort = getDefaultReasoningEffortForModel(
+    selectedProvider,
+    selectedModelOption,
+  );
+  const selectedEffort = composerDraft.effort ?? defaultReasoningEffort;
   const selectedCodexFastModeEnabled =
     selectedProvider === "codex" ? composerDraft.codexFastMode : false;
   const selectedModelOptionsForDispatch = useMemo(() => {
-    if (selectedProvider !== "codex") {
-      return undefined;
+    if (selectedProvider === "codex") {
+      const codexOptions = {
+        ...(supportsReasoningEffort && selectedEffort ? { reasoningEffort: selectedEffort } : {}),
+        ...(selectedCodexFastModeEnabled ? { fastMode: true } : {}),
+      };
+      return Object.keys(codexOptions).length > 0 ? { codex: codexOptions } : undefined;
     }
-    const codexOptions = {
-      ...(supportsReasoningEffort && selectedEffort ? { reasoningEffort: selectedEffort } : {}),
-      ...(selectedCodexFastModeEnabled ? { fastMode: true } : {}),
-    };
-    return Object.keys(codexOptions).length > 0 ? { codex: codexOptions } : undefined;
+    if (selectedProvider === "copilot" && supportsReasoningEffort && selectedEffort) {
+      return {
+        copilot: {
+          reasoningEffort: selectedEffort,
+        },
+      };
+    }
+    return undefined;
   }, [selectedCodexFastModeEnabled, selectedEffort, selectedProvider, supportsReasoningEffort]);
   const selectedProviderStartOptions = useMemo(
     () => getProviderStartOptions(settings, selectedProvider),
     [selectedProvider, settings],
   );
   const selectedModelForPicker = selectedModel;
-  const modelOptionsByProvider = useMemo(
-    () => getCustomModelOptionsByProvider(settings),
-    [settings],
-  );
   const selectedModelForPickerWithCustomFallback = useMemo(() => {
     const currentOptions = modelOptionsByProvider[selectedProvider];
     return currentOptions.some((option) => option.slug === selectedModelForPicker)
@@ -1192,7 +1233,6 @@ export default function ChatView({ threadId }: ChatViewProps) {
   );
   const effectivePathQuery = pathTriggerQuery.length > 0 ? debouncedPathQuery : "";
   const branchesQuery = useQuery(gitBranchesQueryOptions(gitCwd));
-  const serverConfigQuery = useQuery(serverConfigQueryOptions());
   const workspaceEntriesQuery = useQuery(
     projectSearchEntriesQueryOptions({
       cwd: gitCwd,
@@ -1282,7 +1322,6 @@ export default function ChatView({ threadId }: ChatViewProps) {
   );
   const keybindings = serverConfigQuery.data?.keybindings ?? EMPTY_KEYBINDINGS;
   const availableEditors = serverConfigQuery.data?.availableEditors ?? EMPTY_AVAILABLE_EDITORS;
-  const providerStatuses = serverConfigQuery.data?.providers ?? EMPTY_PROVIDER_STATUSES;
   const activeProvider = activeThread?.session?.provider ?? selectedProvider;
   const activeProviderStatus = useMemo(
     () => providerStatuses.find((status) => status.provider === activeProvider) ?? null,
@@ -2332,8 +2371,8 @@ export default function ChatView({ threadId }: ChatViewProps) {
 
   const addComposerImages = (files: File[]) => {
     if (!activeThreadId || files.length === 0) return;
-    if (selectedProvider === "copilot") {
-      setThreadError(activeThreadId, "Copilot does not yet support image attachments.");
+    if (!selectedModelSupportsImages) {
+      setThreadError(activeThreadId, "The selected Copilot model does not support image attachments.");
       return;
     }
 
@@ -2515,8 +2554,8 @@ export default function ChatView({ threadId }: ChatViewProps) {
       return;
     }
     if (!trimmed && composerImages.length === 0) return;
-    if (selectedProvider === "copilot" && composerImages.length > 0) {
-      setThreadError(activeThread.id, "Copilot does not yet support image attachments.");
+    if (!selectedModelSupportsImages && composerImages.length > 0) {
+      setThreadError(activeThread.id, "The selected Copilot model does not support image attachments.");
       return;
     }
     if (!activeProject) return;
@@ -3182,10 +3221,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
   );
   const onEffortSelect = useCallback(
     (effort: CodexReasoningEffort) => {
-      setComposerDraftEffort(threadId, effort);
+      setComposerDraftEffort(threadId, effort, defaultReasoningEffort);
       scheduleComposerFocus();
     },
-    [scheduleComposerFocus, setComposerDraftEffort, threadId],
+    [defaultReasoningEffort, scheduleComposerFocus, setComposerDraftEffort, threadId],
   );
   const onCodexFastModeChange = useCallback(
     (enabled: boolean) => {
@@ -3711,14 +3750,14 @@ export default function ChatView({ threadId }: ChatViewProps) {
                     ? activePendingProgress.activeQuestion?.options.length
                       ? "Type your own answer, or leave this blank to use the selected option"
                       : "Type your answer"
-                    : showPlanFollowUpPrompt && activeProposedPlan
-                      ? "Add feedback to refine the plan, or leave this blank to implement it"
-                      : phase === "disconnected"
-                        ? selectedProvider === "copilot"
-                          ? "Ask for follow-up changes"
-                          : "Ask for follow-up changes or attach images"
-                        : "Ask anything, @tag files/folders, or use /model"
-                }
+                      : showPlanFollowUpPrompt && activeProposedPlan
+                        ? "Add feedback to refine the plan, or leave this blank to implement it"
+                        : phase === "disconnected"
+                          ? selectedModelSupportsImages
+                            ? "Ask for follow-up changes or attach images"
+                            : "Ask for follow-up changes"
+                          : "Ask anything, @tag files/folders, or use /model"
+                 }
                 disabled={isConnecting || isComposerApprovalState}
               />
             </div>
@@ -3776,13 +3815,15 @@ export default function ChatView({ threadId }: ChatViewProps) {
                     />
                   ) : (
                     <>
-                      {selectedProvider === "codex" && selectedEffort != null ? (
+                      {supportsReasoningEffort && selectedEffort != null ? (
                         <>
                           <Separator orientation="vertical" className="mx-0.5 hidden h-4 sm:block" />
-                          <CodexTraitsPicker
+                          <ModelTraitsPicker
                             effort={selectedEffort}
+                            defaultEffort={defaultReasoningEffort}
                             fastModeEnabled={selectedCodexFastModeEnabled}
                             options={reasoningOptions}
+                            showFastMode={selectedProvider === "codex"}
                             onEffortChange={onEffortSelect}
                             onFastModeChange={onCodexFastModeChange}
                           />
@@ -5551,12 +5592,37 @@ const COMING_SOON_PROVIDER_OPTIONS = [
   { id: "gemini", label: "Gemini", icon: Gemini },
 ] as const;
 
+function getRuntimeModelOptionsByProvider(
+  providerStatuses: ReadonlyArray<ServerProviderStatus>,
+): Record<ProviderKind, ReadonlyArray<NonNullable<ServerProviderStatus["availableModels"]>[number]>> {
+  return {
+    codex:
+      providerStatuses.find((status) => status.provider === "codex")?.availableModels ?? [],
+    copilot:
+      providerStatuses.find((status) => status.provider === "copilot")?.availableModels ?? [],
+  };
+}
+
 function getCustomModelOptionsByProvider(
   settings: Pick<AppSettings, "customCodexModels" | "customCopilotModels">,
-): Record<ProviderKind, ReadonlyArray<{ slug: string; name: string }>> {
+  runtimeModelOptionsByProvider: Record<
+    ProviderKind,
+    ReadonlyArray<NonNullable<ServerProviderStatus["availableModels"]>[number]>
+  >,
+): Record<ProviderKind, ReadonlyArray<AppModelOption>> {
   return {
-    codex: getAppModelOptions("codex", getCustomModelsForProvider(settings, "codex")),
-    copilot: getAppModelOptions("copilot", getCustomModelsForProvider(settings, "copilot")),
+    codex: getAppModelOptions(
+      "codex",
+      getCustomModelsForProvider(settings, "codex"),
+      undefined,
+      runtimeModelOptionsByProvider.codex,
+    ),
+    copilot: getAppModelOptions(
+      "copilot",
+      getCustomModelsForProvider(settings, "copilot"),
+      undefined,
+      runtimeModelOptionsByProvider.copilot,
+    ),
   };
 }
 
@@ -5749,7 +5815,7 @@ const CompactComposerControlsMenu = memo(function CompactComposerControlsMenu(pr
   onTogglePlanSidebar: () => void;
   onToggleRuntimeMode: () => void;
 }) {
-  const defaultReasoningEffort = getDefaultReasoningEffort("codex");
+  const defaultReasoningEffort = getDefaultReasoningEffortForModel(props.selectedProvider, null);
   const reasoningLabelByOption: Record<CodexReasoningEffort, string> = {
     low: "Low",
     medium: "Medium",
@@ -5850,15 +5916,16 @@ const CompactComposerControlsMenu = memo(function CompactComposerControlsMenu(pr
   );
 });
 
-const CodexTraitsPicker = memo(function CodexTraitsPicker(props: {
+const ModelTraitsPicker = memo(function ModelTraitsPicker(props: {
   effort: CodexReasoningEffort;
+  defaultEffort: CodexReasoningEffort | null;
   fastModeEnabled: boolean;
   options: ReadonlyArray<CodexReasoningEffort>;
+  showFastMode: boolean;
   onEffortChange: (effort: CodexReasoningEffort) => void;
   onFastModeChange: (enabled: boolean) => void;
 }) {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
-  const defaultReasoningEffort = getDefaultReasoningEffort("codex");
   const reasoningLabelByOption: Record<CodexReasoningEffort, string> = {
     low: "Low",
     medium: "Medium",
@@ -5867,7 +5934,7 @@ const CodexTraitsPicker = memo(function CodexTraitsPicker(props: {
   };
   const triggerLabel = [
     reasoningLabelByOption[props.effort],
-    ...(props.fastModeEnabled ? ["Fast"] : []),
+    ...(props.showFastMode && props.fastModeEnabled ? ["Fast"] : []),
   ]
     .filter(Boolean)
     .join(" · ");
@@ -5906,24 +5973,28 @@ const CodexTraitsPicker = memo(function CodexTraitsPicker(props: {
             {props.options.map((effort) => (
               <MenuRadioItem key={effort} value={effort}>
                 {reasoningLabelByOption[effort]}
-                {effort === defaultReasoningEffort ? " (default)" : ""}
+                {effort === props.defaultEffort ? " (default)" : ""}
               </MenuRadioItem>
             ))}
           </MenuRadioGroup>
         </MenuGroup>
-        <MenuDivider />
-        <MenuGroup>
-          <div className="px-2 py-1.5 font-medium text-muted-foreground text-xs">Fast Mode</div>
-          <MenuRadioGroup
-            value={props.fastModeEnabled ? "on" : "off"}
-            onValueChange={(value) => {
-              props.onFastModeChange(value === "on");
-            }}
-          >
-            <MenuRadioItem value="off">off</MenuRadioItem>
-            <MenuRadioItem value="on">on</MenuRadioItem>
-          </MenuRadioGroup>
-        </MenuGroup>
+        {props.showFastMode ? (
+          <>
+            <MenuDivider />
+            <MenuGroup>
+              <div className="px-2 py-1.5 font-medium text-muted-foreground text-xs">Fast Mode</div>
+              <MenuRadioGroup
+                value={props.fastModeEnabled ? "on" : "off"}
+                onValueChange={(value) => {
+                  props.onFastModeChange(value === "on");
+                }}
+              >
+                <MenuRadioItem value="off">off</MenuRadioItem>
+                <MenuRadioItem value="on">on</MenuRadioItem>
+              </MenuRadioGroup>
+            </MenuGroup>
+          </>
+        ) : null}
       </MenuPopup>
     </Menu>
   );

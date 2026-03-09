@@ -470,6 +470,11 @@ it.effect("ProviderServiceLive restores persisted Copilot provider options durin
         provider: "copilot",
         cwd: "/tmp/project-copilot",
         model: "gpt-5",
+        modelOptions: {
+          copilot: {
+            reasoningEffort: "medium",
+          },
+        },
         runtimeMode: "full-access",
         threadId,
         providerOptions: {
@@ -492,11 +497,16 @@ it.effect("ProviderServiceLive restores persisted Copilot provider options durin
       assert.equal(persistedAfterStopAll.value.status, "stopped");
       assert.deepEqual(persistedAfterStopAll.value.resumeCursor, startedSession.resumeCursor);
       const payload = persistedAfterStopAll.value.runtimePayload;
-      assert.equal(payload !== null && typeof payload === "object" && !Array.isArray(payload), true);
-      if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
-        assert.deepEqual((payload as { providerOptions?: unknown }).providerOptions, {
-          copilot: {
-            cliUrl: "http://127.0.0.1:8123",
+        assert.equal(payload !== null && typeof payload === "object" && !Array.isArray(payload), true);
+        if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+          assert.deepEqual((payload as { modelOptions?: unknown }).modelOptions, {
+            copilot: {
+              reasoningEffort: "medium",
+            },
+          });
+          assert.deepEqual((payload as { providerOptions?: unknown }).providerOptions, {
+            copilot: {
+              cliUrl: "http://127.0.0.1:8123",
             configDir: "/tmp/copilot-config",
           },
         });
@@ -543,10 +553,16 @@ it.effect("ProviderServiceLive restores persisted Copilot provider options durin
         threadId?: string;
         providerOptions?: unknown;
         model?: string;
+        modelOptions?: unknown;
       };
       assert.equal(startPayload.provider, "copilot");
       assert.equal(startPayload.cwd, "/tmp/project-copilot");
       assert.equal(startPayload.model, "gpt-5");
+      assert.deepEqual(startPayload.modelOptions, {
+        copilot: {
+          reasoningEffort: "medium",
+        },
+      });
       assert.deepEqual(startPayload.resumeCursor, startedSession.resumeCursor);
       assert.equal(startPayload.threadId, startedSession.threadId);
       assert.deepEqual(startPayload.providerOptions, {

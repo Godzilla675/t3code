@@ -3,8 +3,10 @@ import { DEFAULT_MODEL_BY_PROVIDER, MODEL_OPTIONS_BY_PROVIDER } from "@t3tools/c
 
 import {
   getDefaultModel,
+  getDefaultReasoningEffortForModel,
   getDefaultReasoningEffort,
   getModelOptions,
+  getReasoningEffortOptionsForModel,
   getReasoningEffortOptions,
   normalizeModelSlug,
   resolveModelSlug,
@@ -72,9 +74,38 @@ describe("getReasoningEffortOptions", () => {
   });
 });
 
+describe("getReasoningEffortOptionsForModel", () => {
+  it("falls back to provider defaults for codex models without explicit metadata", () => {
+    expect(getReasoningEffortOptionsForModel("codex", null)).toEqual(["xhigh", "high", "medium", "low"]);
+  });
+
+  it("uses runtime model metadata for Copilot models", () => {
+    expect(
+      getReasoningEffortOptionsForModel("copilot", {
+        supportedReasoningEfforts: ["medium", "low"],
+      }),
+    ).toEqual(["medium", "low"]);
+  });
+});
+
 describe("getDefaultReasoningEffort", () => {
   it("returns provider-scoped defaults", () => {
     expect(getDefaultReasoningEffort("codex")).toBe("high");
     expect(getDefaultReasoningEffort("copilot")).toBeNull();
+  });
+});
+
+describe("getDefaultReasoningEffortForModel", () => {
+  it("falls back to provider defaults for codex models without explicit metadata", () => {
+    expect(getDefaultReasoningEffortForModel("codex", null)).toBe("high");
+  });
+
+  it("uses runtime Copilot model metadata when present", () => {
+    expect(
+      getDefaultReasoningEffortForModel("copilot", {
+        supportedReasoningEfforts: ["medium", "low"],
+        defaultReasoningEffort: "medium",
+      }),
+    ).toBe("medium");
   });
 });

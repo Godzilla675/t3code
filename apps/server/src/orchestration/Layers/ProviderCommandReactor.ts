@@ -3,14 +3,14 @@ import {
   CommandId,
   EventId,
   type OrchestrationEvent,
+  type OrchestrationSession,
   type ProviderModelOptions,
   type ProviderKind,
-  type ProviderStartOptions,
-  type OrchestrationSession,
-  ThreadId,
+  type ProviderServiceTier,
   type ProviderSession,
   type ProviderStartOptions,
   type RuntimeMode,
+  ThreadId,
   type TurnId,
 } from "@t3tools/contracts";
 import { Cache, Cause, Duration, Effect, Layer, Option, Queue, Schema, Stream } from "effect";
@@ -18,6 +18,10 @@ import { Cache, Cause, Duration, Effect, Layer, Option, Queue, Schema, Stream } 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { GitCore } from "../../git/Services/GitCore.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
+import {
+  providerModelOptionsEqual,
+  readPersistedProviderModelOptions,
+} from "../../provider/providerModelOptions.ts";
 import {
   providerStartOptionsEqual,
   readPersistedProviderStartOptions,
@@ -211,8 +215,8 @@ const make = Effect.gen(function* () {
       readonly provider?: ProviderKind;
       readonly providerOptions?: ProviderStartOptions;
       readonly model?: string;
-      readonly modelOptions?: ProviderModelOptions;
-      readonly providerOptions?: ProviderStartOptions;
+      readonly modelOptions?: ProviderModelOptions | undefined;
+      readonly serviceTier?: ProviderServiceTier | null;
     },
   ) {
     const readModel = yield* orchestrationEngine.getReadModel();
@@ -237,6 +241,8 @@ const make = Effect.gen(function* () {
       providerService.listSessions().pipe(
         Effect.map((sessions) => sessions.find((session) => session.threadId === threadId)),
       );
+    const hasRequestedModelOptions =
+      options !== undefined && Object.prototype.hasOwnProperty.call(options, "modelOptions");
 
     const startProviderSession = (input?: {
       readonly resumeCursor?: unknown;
@@ -252,8 +258,8 @@ const make = Effect.gen(function* () {
         ...(providerOptions !== undefined ? { providerOptions } : {}),
         ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
         ...(desiredModel ? { model: desiredModel } : {}),
-        ...(options?.modelOptions !== undefined ? { modelOptions: options.modelOptions } : {}),
-        ...(options?.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
+        ...(options?.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
+        ...(hasRequestedModelOptions ? { modelOptions: options?.modelOptions } : {}),
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
         runtimeMode: desiredRuntimeMode,
       });
@@ -293,14 +299,26 @@ const make = Effect.gen(function* () {
       const shouldRestartForModelChange =
         modelChanged && sessionModelSwitch === "restart-session";
       const persistedProviderOptions = readPersistedProviderStartOptions(binding?.runtimePayload);
+      const persistedModelOptions = readPersistedProviderModelOptions(binding?.runtimePayload);
       const providerOptionsChanged =
         options?.providerOptions !== undefined &&
         !providerStartOptionsEqual(
           persistedProviderOptions,
           options.providerOptions,
         );
+      const modelOptionsChanged =
+        hasRequestedModelOptions &&
+        !providerModelOptionsEqual(persistedModelOptions, options.modelOptions);
+      const shouldRestartForModelOptionsChange =
+        modelOptionsChanged && (options?.provider ?? currentProvider) === "copilot";
 
-      if (!runtimeModeChanged && !providerChanged && !shouldRestartForModelChange && !providerOptionsChanged) {
+      if (
+        !runtimeModeChanged &&
+        !providerChanged &&
+        !shouldRestartForModelChange &&
+        !providerOptionsChanged &&
+        !shouldRestartForModelOptionsChange
+      ) {
         return existingSessionThreadId;
       }
 
@@ -319,6 +337,8 @@ const make = Effect.gen(function* () {
         providerChanged,
         modelChanged,
         shouldRestartForModelChange,
+        modelOptionsChanged,
+        shouldRestartForModelOptionsChange,
         providerOptionsChanged,
         hasResumeCursor: resumeCursor !== undefined,
       });
@@ -372,7 +392,7 @@ const make = Effect.gen(function* () {
     readonly providerOptions?: ProviderStartOptions;
     readonly model?: string;
     readonly modelOptions?: ProviderModelOptions;
-    readonly providerOptions?: ProviderStartOptions;
+    readonly serviceTier?: ProviderServiceTier | null;
     readonly interactionMode?: "default" | "plan";
     readonly createdAt: string;
   }) {
@@ -387,8 +407,8 @@ const make = Effect.gen(function* () {
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
       ...(input.modelOptions !== undefined ? { modelOptions: input.modelOptions } : {}),
-      ...(input.providerOptions !== undefined ? { providerOptions: input.providerOptions } : {}),
     });
     const normalizedInput = toNonEmptyProviderInput(input.messageText);
     const normalizedAttachments = input.attachments ?? [];

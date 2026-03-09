@@ -21,6 +21,7 @@ const GitCoreTestLayer = GitCoreLive.pipe(
   Layer.provide(NodeServices.layer),
 );
 const TestLayer = Layer.mergeAll(NodeServices.layer, GitServiceTestLayer, GitCoreTestLayer);
+const GitCoreSlowTestTimeoutMs = 15_000;
 
 function makeTmpDir(
   prefix = "git-test-",
@@ -322,7 +323,7 @@ it.layer(TestLayer)("git integration", (it) => {
         const result = yield* listGitBranches({ cwd: tmp });
         expect(result.branches[0]!.name).toBe("older-branch");
         expect(result.branches[1]!.name).toBe("newer-branch");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("keeps default branch right after current branch", () =>
@@ -366,7 +367,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(result.branches[0]!.name).toBe("current-branch");
         expect(result.branches[1]!.name).toBe(defaultBranch);
         expect(result.branches[2]!.name).toBe("newer-branch");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("lists multiple branches after creating them", () =>
@@ -380,7 +381,7 @@ it.layer(TestLayer)("git integration", (it) => {
         const names = result.branches.map((b) => b.name);
         expect(names).toContain("feature-a");
         expect(names).toContain("feature-b");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("isDefault is false when no remote exists", () =>
@@ -433,7 +434,7 @@ it.layer(TestLayer)("git integration", (it) => {
             (branch) => branch.name === "origin/feature/remote-only" && branch.isRemote,
           ),
         ).toBe(true);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("includes remoteName metadata for remotes with slash in the name", () =>
@@ -465,7 +466,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(remoteBranch).toBeDefined();
         expect(remoteBranch?.isRemote).toBe(true);
         expect(remoteBranch?.remoteName).toBe(remoteName);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -528,7 +529,7 @@ it.layer(TestLayer)("git integration", (it) => {
             expect(details.behindCount).toBe(1);
           }),
         );
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("keeps checkout successful when upstream refresh fails", () =>
@@ -1338,7 +1339,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(pushed.status).toBe("skipped_up_to_date");
         expect(pushed.branch).toBe("feature/no-upstream-no-ahead");
         expect(pushed.setUpstream).toBeUndefined();
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("pushes with upstream setup when no comparable base branch exists", () =>
@@ -1363,7 +1364,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(yield* git(tmp, ["rev-parse", "--abbrev-ref", "@{upstream}"])).toBe(
           "origin/feature/no-base",
         );
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect(
@@ -1400,6 +1401,7 @@ it.layer(TestLayer)("git integration", (it) => {
             featureBranch,
           );
         }),
+      GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("includes command context when worktree removal fails", () =>
@@ -1460,6 +1462,7 @@ it.layer(TestLayer)("git integration", (it) => {
           expect(details.aheadCount).toBe(0);
           expect(details.behindCount).toBe(1);
         }),
+      GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("prepares commit context by auto-staging and creates commit", () =>
@@ -1505,7 +1508,7 @@ it.layer(TestLayer)("git integration", (it) => {
 
         const skipped = yield* core.pushCurrentBranch(tmp, null);
         expect(skipped.status).toBe("skipped_up_to_date");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("pulls behind branch and then reports up-to-date", () =>
@@ -1537,7 +1540,7 @@ it.layer(TestLayer)("git integration", (it) => {
 
         const skipped = yield* core.pullCurrentBranch(source);
         expect(skipped.status).toBe("skipped_up_to_date");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("top-level pullGitBranch rejects when no upstream exists", () =>

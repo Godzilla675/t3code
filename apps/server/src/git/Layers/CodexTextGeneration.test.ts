@@ -1,3 +1,4 @@
+import nodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { Effect, FileSystem, Layer, Path } from "effect";
@@ -19,56 +20,80 @@ function makeFakeCodexBinary(dir: string) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const binDir = path.join(dir, "bin");
-    const codexPath = path.join(binDir, "codex");
+    const runnerPath = path.join(binDir, "fake-codex.cjs");
+    const posixCodexPath = path.join(binDir, "codex");
+    const windowsCodexPath = path.join(binDir, "codex.cmd");
     yield* fs.makeDirectory(binDir, { recursive: true });
 
     yield* fs.writeFileString(
-      codexPath,
+      runnerPath,
       [
-        "#!/bin/sh",
-        'output_path=""',
-        "while [ $# -gt 0 ]; do",
-        '  if [ "$1" = "--image" ]; then',
-        "    shift",
-        '    if [ -n "$1" ]; then',
-        '      seen_image="1"',
-        "    fi",
-        "    continue",
-        "  fi",
-        '  if [ "$1" = "--output-last-message" ]; then',
-        "    shift",
-        '    output_path="$1"',
-        "  fi",
-        "  shift",
-        "done",
-        'stdin_content="$(cat)"',
-        'if [ "$T3_FAKE_CODEX_REQUIRE_IMAGE" = "1" ] && [ "$seen_image" != "1" ]; then',
-        '  printf "%s\\n" "missing --image input" >&2',
-        "  exit 2",
-        "fi",
-        'if [ -n "$T3_FAKE_CODEX_STDIN_MUST_CONTAIN" ]; then',
-        '  printf "%s" "$stdin_content" | grep -F -- "$T3_FAKE_CODEX_STDIN_MUST_CONTAIN" >/dev/null || {',
-        '    printf "%s\\n" "stdin missing expected content" >&2',
-        "    exit 3",
+        'const fs = require("node:fs");',
+        "",
+        "const args = process.argv.slice(2);",
+        'let outputPath = "";',
+        "let seenImage = false;",
+        "",
+        "for (let index = 0; index < args.length; index += 1) {",
+        "  const arg = args[index];",
+        '  if (arg === "--image") {',
+        "    if (args[index + 1]) {",
+        "      seenImage = true;",
+        "      index += 1;",
+        "    }",
+        "    continue;",
         "  }",
-        "fi",
-        'if [ -n "$T3_FAKE_CODEX_STDIN_MUST_NOT_CONTAIN" ]; then',
-        '  if printf "%s" "$stdin_content" | grep -F -- "$T3_FAKE_CODEX_STDIN_MUST_NOT_CONTAIN" >/dev/null; then',
-        '    printf "%s\\n" "stdin contained forbidden content" >&2',
-        "    exit 4",
-        "  fi",
-        "fi",
-        'if [ -n "$T3_FAKE_CODEX_STDERR" ]; then',
-        '  printf "%s\\n" "$T3_FAKE_CODEX_STDERR" >&2',
-        "fi",
-        'if [ -n "$output_path" ]; then',
-        '  node -e \'const fs=require("node:fs"); const value=process.argv[2] ?? ""; fs.writeFileSync(process.argv[1], Buffer.from(value, "base64"));\' "$output_path" "${T3_FAKE_CODEX_OUTPUT_B64:-e30=}"',
-        "fi",
-        'exit "${T3_FAKE_CODEX_EXIT_CODE:-0}"',
+        '  if (arg === "--output-last-message") {',
+        '    outputPath = args[index + 1] ?? "";',
+        "    index += 1;",
+        "  }",
+        "}",
+        "",
+        'const stdinContent = fs.readFileSync(0, "utf8");',
+        "",
+        "const fail = (message, code) => {",
+        '  process.stderr.write(`${message}\\n`);',
+        "  process.exit(code);",
+        "};",
+        "",
+        'if (process.env.T3_FAKE_CODEX_REQUIRE_IMAGE === "1" && !seenImage) {',
+        '  fail("missing --image input", 2);',
+        "}",
+        "",
+        "const mustContain = process.env.T3_FAKE_CODEX_STDIN_MUST_CONTAIN;",
+        'if (mustContain && !stdinContent.includes(mustContain)) {',
+        '  fail("stdin missing expected content", 3);',
+        "}",
+        "",
+        "const mustNotContain = process.env.T3_FAKE_CODEX_STDIN_MUST_NOT_CONTAIN;",
+        "if (mustNotContain && stdinContent.includes(mustNotContain)) {",
+        '  fail("stdin contained forbidden content", 4);',
+        "}",
+        "",
+        "if (process.env.T3_FAKE_CODEX_STDERR) {",
+        '  process.stderr.write(`${process.env.T3_FAKE_CODEX_STDERR}\\n`);',
+        "}",
+        "",
+        "if (outputPath) {",
+        '  const value = process.env.T3_FAKE_CODEX_OUTPUT_B64 ?? "e30=";',
+        '  fs.writeFileSync(outputPath, Buffer.from(value, "base64"));',
+        "}",
+        "",
+        'process.exit(Number(process.env.T3_FAKE_CODEX_EXIT_CODE ?? "0"));',
         "",
       ].join("\n"),
     );
-    yield* fs.chmod(codexPath, 0o755);
+    yield* fs.writeFileString(
+      posixCodexPath,
+      ['#!/bin/sh', 'node "$(dirname "$0")/fake-codex.cjs" "$@"', ""].join("\n"),
+    );
+    yield* fs.writeFileString(
+      windowsCodexPath,
+      ['@echo off', 'node "%~dp0fake-codex.cjs" %*', ""].join("\r\n"),
+    );
+    if (process.platform !== "win32") {
+      yield* fs.chmod(posixCodexPath, 0o755);
+    }
     return binDir;
   });
 }
@@ -98,7 +123,7 @@ function withFakeCodexEnv<A, E, R>(
       const previousStdinMustNotContain = process.env.T3_FAKE_CODEX_STDIN_MUST_NOT_CONTAIN;
 
       yield* Effect.sync(() => {
-        process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+        process.env.PATH = `${binDir}${nodePath.delimiter}${previousPath ?? ""}`;
         process.env.T3_FAKE_CODEX_OUTPUT_B64 = Buffer.from(input.output, "utf8").toString("base64");
 
         if (input.exitCode !== undefined) {

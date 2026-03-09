@@ -12,6 +12,7 @@ import { NetService } from "@t3tools/shared/Net";
 
 import { CliConfig, recordStartupHeartbeat, t3Cli, type CliConfigShape } from "./main";
 import { ServerConfig, type ServerConfigShape } from "./config";
+import { resolveStateDir } from "./os-jank";
 import { Open, type OpenShape } from "./open";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService";
@@ -29,6 +30,7 @@ const serverStart = Effect.acquireRelease(
   () => Effect.sync(() => stop()),
 );
 const findAvailablePort = vi.fn((preferred: number) => Effect.succeed(preferred));
+const MainCliSlowTestTimeoutMs = process.platform === "win32" ? 10_000 : 7_500;
 
 // Shared service layer used by this CLI test suite.
 const testLayer = Layer.mergeAll(
@@ -75,6 +77,11 @@ const runCli = (
   );
 };
 
+const expectResolvedStateDir = (actual: string | undefined, raw: string) =>
+  Effect.gen(function* () {
+    assert.equal(actual, yield* resolveStateDir(raw));
+  });
+
 beforeEach(() => {
   vi.clearAllMocks();
   resolvedConfig = null;
@@ -106,14 +113,14 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4010);
       assert.equal(resolvedConfig?.host, "0.0.0.0");
-      assert.equal(resolvedConfig?.stateDir, "/tmp/t3-cli-state");
+      yield* expectResolvedStateDir(resolvedConfig?.stateDir, "/tmp/t3-cli-state");
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://127.0.0.1:5173/");
       assert.equal(resolvedConfig?.noBrowser, true);
       assert.equal(resolvedConfig?.authToken, "auth-secret");
       assert.equal(resolvedConfig?.autoBootstrapProjectFromCwd, false);
       assert.equal(resolvedConfig?.logWebSocketEvents, true);
       assert.equal(stop.mock.calls.length, 1);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("supports --token as an alias for --auth-token", () =>
@@ -141,14 +148,14 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4999);
       assert.equal(resolvedConfig?.host, "100.88.10.4");
-      assert.equal(resolvedConfig?.stateDir, "/tmp/t3-env-state");
+      yield* expectResolvedStateDir(resolvedConfig?.stateDir, "/tmp/t3-env-state");
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://localhost:5173/");
       assert.equal(resolvedConfig?.noBrowser, true);
       assert.equal(resolvedConfig?.authToken, "env-token");
       assert.equal(resolvedConfig?.autoBootstrapProjectFromCwd, false);
       assert.equal(resolvedConfig?.logWebSocketEvents, true);
       assert.equal(findAvailablePort.mock.calls.length, 0);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("prefers --mode over T3CODE_MODE", () =>

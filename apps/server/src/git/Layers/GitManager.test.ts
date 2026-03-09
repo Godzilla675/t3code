@@ -322,6 +322,7 @@ function makeManager(input?: {
 }
 
 const GitManagerTestLayer = Layer.provideMerge(GitServiceLive, NodeServices.layer);
+const GitManagerSlowTestTimeoutMs = 15_000;
 
 it.layer(GitManagerTestLayer)("GitManager", (it) => {
   it.effect("status includes PR metadata when branch already has an open PR", () =>
@@ -359,7 +360,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         headBranch: "feature/status-open-pr",
         state: "open",
       });
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("status returns merged PR state when latest PR was merged", () =>
@@ -397,7 +398,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         headBranch: "feature/status-merged-pr",
         state: "merged",
       });
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("status prefers open PR when merged PR has newer updatedAt", () =>
@@ -444,7 +445,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         headBranch: "feature/status-open-over-merged",
         state: "open",
       });
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("status is resilient to gh lookup failures and returns pr null", () =>
@@ -468,7 +469,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const status = yield* manager.status({ cwd: repoDir });
       expect(status.branch).toBe("feature/status-no-gh");
       expect(status.pr).toBeNull();
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("creates a commit when working tree is dirty", () =>
@@ -492,7 +493,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           Effect.map((result) => result.stdout.trim()),
         ),
       ).toBe("Implement stacked git actions");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("uses custom commit message when provided", () =>
@@ -535,7 +536,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           Effect.map((result) => result.stdout.trim()),
         ),
       ).toContain("- details from user");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("creates feature branch, commits, and pushes with featureBranch option", () =>
@@ -587,7 +588,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       );
       expect(mergeBase).toBe(mainSha);
       expect(generatedCount).toBe(1);
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("featureBranch uses custom commit message and derives branch name", () =>
@@ -630,7 +631,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         Effect.map((r) => r.stdout.trim()),
       );
       expect(mergeBase).toBe(mainSha);
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("skips commit when there are no uncommitted changes", () =>
@@ -648,7 +649,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       expect(result.commit.status).toBe("skipped_no_changes");
       expect(result.push.status).toBe("skipped_not_requested");
       expect(result.pr.status).toBe("skipped_not_requested");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("featureBranch returns error when worktree is clean", () =>
@@ -745,7 +746,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
             call.includes("pr create --base main --head feature/no-upstream-pr"),
           ),
         ).toBe(true);
-      }),
+      }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("skips push when branch is already up to date", () =>

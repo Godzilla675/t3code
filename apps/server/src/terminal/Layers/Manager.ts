@@ -55,23 +55,39 @@ function normalizeShellCommand(value: string | undefined): string | null {
   if (!value) return null;
   const trimmed = value.trim();
   if (trimmed.length === 0) return null;
-
-  if (process.platform === "win32") {
-    return trimmed;
-  }
-
-  const firstToken = trimmed.split(/\s+/g)[0]?.trim();
-  if (!firstToken) return null;
-  return firstToken.replace(/^['"]|['"]$/g, "");
+  return trimmed;
 }
 
 function shellCandidateFromCommand(command: string | null): ShellCandidate | null {
   if (!command || command.length === 0) return null;
-  const shellName = path.basename(command).toLowerCase();
-  if (process.platform !== "win32" && shellName === "zsh") {
-    return { shell: command, args: ["-o", "nopromptsp"] };
+  if (process.platform === "win32") {
+    const doubleQuotedMatch = /^"([^"]+)"(?:\s+(.*))?$/.exec(command);
+    const singleQuotedMatch = /^'([^']+)'(?:\s+(.*))?$/.exec(command);
+    const plainMatch = /^(\S+)(?:\s+(.*))?$/.exec(command);
+    const shell = (doubleQuotedMatch?.[1] ?? singleQuotedMatch?.[1] ?? plainMatch?.[1] ?? "").trim();
+    if (!shell) return null;
+    const argsText =
+      (doubleQuotedMatch?.[2] ?? singleQuotedMatch?.[2] ?? plainMatch?.[2] ?? "").trim();
+    const args =
+      argsText.length === 0
+        ? undefined
+        : Array.from(argsText.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g), (entry) =>
+            (entry[1] ?? entry[2] ?? entry[3] ?? "").trim(),
+          ).filter((entry) => entry.length > 0);
+    return {
+      shell,
+      ...(args && args.length > 0 ? { args } : {}),
+    };
   }
-  return { shell: command };
+
+  const firstToken = command.split(/\s+/g)[0]?.trim();
+  if (!firstToken) return null;
+  const normalizedShell = firstToken.replace(/^['"]|['"]$/g, "");
+  const shellName = path.basename(normalizedShell).toLowerCase();
+  if (shellName === "zsh") {
+    return { shell: normalizedShell, args: ["-o", "nopromptsp"] };
+  }
+  return { shell: normalizedShell };
 }
 
 function formatShellCandidate(candidate: ShellCandidate): string {

@@ -33,6 +33,11 @@ const THREAD_ID = ThreadId.makeUnsafe("thread-1");
 const FIXTURE_TURN_ID = "fixture-turn";
 const APPROVAL_REQUEST_ID = asApprovalRequestId("req-approval-1");
 type IntegrationProvider = "codex";
+const OrchestrationIntegrationSlowTestTimeoutMs = process.platform === "win32" ? 15_000 : 10_000;
+
+function normalizeLineEndings(value: string): string {
+  return value.replace(/\r\n/g, "\n");
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -217,7 +222,7 @@ it.live("runs a single turn end-to-end and persists checkpoint state in sqlite +
       assert.equal(gitShowFileAtRef(harness.workspaceDir, ref0, "README.md"), "v1\n");
       assert.equal(gitShowFileAtRef(harness.workspaceDir, ref1, "README.md"), "v1\n");
     }),
-  ),
+  ), OrchestrationIntegrationSlowTestTimeoutMs,
 );
 
 it.live.skipIf(!process.env.CODEX_BINARY_PATH)(
@@ -465,7 +470,7 @@ it.live("runs multi-turn file edits and persists checkpoint diffs", () =>
         "v3\n",
       );
     }),
-  ),
+  ), OrchestrationIntegrationSlowTestTimeoutMs,
 );
 
 it.live("tracks approval requests and resolves pending approvals on user response", () =>
@@ -546,7 +551,7 @@ it.live("tracks approval requests and resolves pending approvals on user respons
       assert.equal(approvalResponses[0]?.requestId, "req-approval-1");
       assert.equal(approvalResponses[0]?.decision, "accept");
     }),
-  ),
+  ), OrchestrationIntegrationSlowTestTimeoutMs,
 );
 
 it.live("records failed turn runtime state and checkpoint status as error", () =>
@@ -625,7 +630,7 @@ it.live("records failed turn runtime state and checkpoint status as error", () =
         true,
       );
     }),
-  ),
+  ), OrchestrationIntegrationSlowTestTimeoutMs,
 );
 
 it.live("reverts to an earlier checkpoint and trims checkpoint projections + git refs", () =>
@@ -791,7 +796,10 @@ it.live("reverts to an earlier checkpoint and trims checkpoint projections + git
         ),
         true,
       );
-      assert.equal(fs.readFileSync(path.join(harness.workspaceDir, "README.md"), "utf8"), "v2\n");
+      assert.equal(
+        normalizeLineEndings(fs.readFileSync(path.join(harness.workspaceDir, "README.md"), "utf8")),
+        "v2\n",
+      );
       assert.equal(
         gitRefExists(harness.workspaceDir, checkpointRefForThreadTurn(THREAD_ID, 2)),
         false,
@@ -803,7 +811,7 @@ it.live("reverts to an earlier checkpoint and trims checkpoint projections + git
       });
       assert.equal(checkpointRows.length, 1);
     }),
-  ),
+  ), OrchestrationIntegrationSlowTestTimeoutMs,
 );
 
 it.live(

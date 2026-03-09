@@ -19,6 +19,8 @@ import {
 import { TerminalManagerRuntime } from "./Manager";
 import { Effect, Encoding } from "effect";
 
+const TerminalManagerSlowTestTimeoutMs = process.platform === "win32" ? 10_000 : 7_500;
+
 class FakePtyProcess implements PtyProcess {
   readonly writes: string[] = [];
   readonly resizeCalls: Array<{ cols: number; rows: number }> = [];
@@ -496,23 +498,27 @@ describe("TerminalManager", () => {
     expect(fs.existsSync(multiTerminalHistoryLogPath(logsDir, "thread-1", "sidecar"))).toBe(false);
 
     manager.dispose();
-  });
+  }, TerminalManagerSlowTestTimeoutMs);
 
-  it("escalates terminal shutdown to SIGKILL when process does not exit in time", async () => {
-    const { manager, ptyAdapter } = makeManager(5, { processKillGraceMs: 10 });
-    await manager.open(openInput());
-    const process = ptyAdapter.processes[0];
-    expect(process).toBeDefined();
-    if (!process) return;
+  it(
+    "escalates terminal shutdown to SIGKILL when process does not exit in time",
+    async () => {
+      const { manager, ptyAdapter } = makeManager(5, { processKillGraceMs: 10 });
+      await manager.open(openInput());
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
 
-    await manager.close({ threadId: "thread-1" });
-    await waitFor(() => process.killSignals.includes("SIGKILL"));
+      await manager.close({ threadId: "thread-1" });
+      await waitFor(() => process.killSignals.includes("SIGKILL"));
 
-    expect(process.killSignals[0]).toBe("SIGTERM");
-    expect(process.killSignals).toContain("SIGKILL");
+      expect(process.killSignals[0]).toBe("SIGTERM");
+      expect(process.killSignals).toContain("SIGKILL");
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
   it("evicts oldest inactive terminal sessions when retention limit is exceeded", async () => {
     const { manager, ptyAdapter } = makeManager(5, { maxRetainedInactiveSessions: 1 });
@@ -540,7 +546,7 @@ describe("TerminalManager", () => {
     expect(keys).toEqual(["thread-2\u0000default"]);
 
     manager.dispose();
-  });
+  }, TerminalManagerSlowTestTimeoutMs);
 
   it("migrates legacy transcript filenames to terminal-scoped history path on open", async () => {
     const { manager, logsDir } = makeManager();
@@ -558,34 +564,42 @@ describe("TerminalManager", () => {
     manager.dispose();
   });
 
-  it("retries with fallback shells when preferred shell spawn fails", async () => {
-    const { manager, ptyAdapter } = makeManager(5, {
-      shellResolver: () => "/definitely/missing-shell -l",
-    });
-    ptyAdapter.spawnFailures.push(new Error("posix_spawnp failed."));
+  it(
+    "retries with fallback shells when preferred shell spawn fails",
+    async () => {
+      const { manager, ptyAdapter } = makeManager(5, {
+        shellResolver: () => "/definitely/missing-shell -l",
+      });
+      ptyAdapter.spawnFailures.push(new Error("posix_spawnp failed."));
 
-    const snapshot = await manager.open(openInput());
+      const snapshot = await manager.open(openInput());
 
-    expect(snapshot.status).toBe("running");
-    expect(ptyAdapter.spawnInputs.length).toBeGreaterThanOrEqual(2);
-    expect(ptyAdapter.spawnInputs[0]?.shell).toBe("/definitely/missing-shell");
+      expect(snapshot.status).toBe("running");
+      expect(ptyAdapter.spawnInputs.length).toBeGreaterThanOrEqual(2);
+      expect(ptyAdapter.spawnInputs[0]?.shell).toBe("/definitely/missing-shell");
+      if (process.platform === "win32") {
+        expect(ptyAdapter.spawnInputs[0]?.args).toEqual(["-l"]);
+      }
 
-    if (process.platform === "win32") {
-      expect(
-        ptyAdapter.spawnInputs.some(
-          (input) => input.shell === "cmd.exe" || input.shell === "powershell.exe",
-        ),
-      ).toBe(true);
-    } else {
-      expect(
-        ptyAdapter.spawnInputs.some((input) =>
-          ["/bin/zsh", "/bin/bash", "/bin/sh", "zsh", "bash", "sh"].includes(input.shell),
-        ),
-      ).toBe(true);
-    }
+      if (process.platform === "win32") {
+        expect(
+          ptyAdapter.spawnInputs.some((input) => {
+            const shellName = path.basename(input.shell).toLowerCase();
+            return shellName === "cmd.exe" || shellName === "powershell.exe";
+          }),
+        ).toBe(true);
+      } else {
+        expect(
+          ptyAdapter.spawnInputs.some((input) =>
+            ["/bin/zsh", "/bin/bash", "/bin/sh", "zsh", "bash", "sh"].includes(input.shell),
+          ),
+        ).toBe(true);
+      }
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
   it("filters app runtime env variables from terminal sessions", async () => {
     const originalValues = new Map<string, string | undefined>();

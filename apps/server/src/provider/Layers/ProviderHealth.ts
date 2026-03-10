@@ -16,7 +16,7 @@ import {
   type ServerProviderStatus,
   type ServerProviderStatusState,
 } from "@t3tools/contracts";
-import { Effect, Layer, Option, Result, Schema, Stream } from "effect";
+import { Array, Effect, Fiber, Layer, Option, Result, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { loadCopilotSdk } from "../copilotSdkCompat.ts";
@@ -666,10 +666,20 @@ export const checkCopilotProviderStatus = (options?: {
 export const ProviderHealthLive = Layer.effect(
   ProviderHealth,
   Effect.gen(function* () {
-    const codexStatus = yield* checkCodexProviderStatus;
-    const copilotStatus = yield* checkCopilotProviderStatus();
+    const codexStatusFiber = yield* checkCodexProviderStatus.pipe(
+      Effect.map(Array.of),
+      Effect.forkScoped,
+    );
+
+    const copilotStatusFiber = yield* checkCopilotProviderStatus().pipe(
+      Effect.map(Array.of),
+      Effect.forkScoped,
+    );
+
     return {
-      getStatuses: Effect.succeed([codexStatus, copilotStatus]),
+      getStatuses: Effect.all([Fiber.join(codexStatusFiber), Fiber.join(copilotStatusFiber)]).pipe(
+        Effect.map(([codexStatuses, copilotStatuses]) => codexStatuses.concat(copilotStatuses)),
+      ),
     } satisfies ProviderHealthShape;
   }),
 );

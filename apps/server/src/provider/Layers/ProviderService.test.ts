@@ -469,7 +469,7 @@ it.effect("ProviderServiceLive restores persisted Copilot provider options durin
       return yield* provider.startSession(threadId, {
         provider: "copilot",
         cwd: "/tmp/project-copilot",
-        model: "gpt-5",
+        model: "gpt-4.1",
         modelOptions: {
           copilot: {
             reasoningEffort: "medium",
@@ -557,7 +557,7 @@ it.effect("ProviderServiceLive restores persisted Copilot provider options durin
       };
       assert.equal(startPayload.provider, "copilot");
       assert.equal(startPayload.cwd, "/tmp/project-copilot");
-      assert.equal(startPayload.model, "gpt-5");
+      assert.equal(startPayload.model, "gpt-4.1");
       assert.deepEqual(startPayload.modelOptions, {
         copilot: {
           reasoningEffort: "medium",

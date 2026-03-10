@@ -61,7 +61,7 @@ const MODEL_PROVIDER_SETTINGS: Array<{
     title: "Copilot",
     description: "Save additional Copilot model slugs for the picker and `/model` command.",
     placeholder: "your-copilot-model-slug",
-    example: "gpt-5",
+    example: "claude-sonnet-4.6",
   },
 ] as const;
 

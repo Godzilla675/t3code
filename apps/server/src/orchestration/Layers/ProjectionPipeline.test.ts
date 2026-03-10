@@ -1911,7 +1911,7 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
             runOnWorktreeCreate: false,
           },
         ],
-        defaultModel: "gpt-5",
+        defaultModel: "gpt-4.1",
       });
 
       const projectRows = yield* sql<{
@@ -1928,7 +1928,7 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
         {
           scriptsJson:
             '[{"id":"script-1","name":"Build","command":"bun run build","icon":"build","runOnWorktreeCreate":false}]',
-          defaultModel: "gpt-5",
+          defaultModel: "gpt-4.1",
         },
       ]);
     }),

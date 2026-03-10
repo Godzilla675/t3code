@@ -434,7 +434,7 @@ describe("ProviderCommandReactor", () => {
             configDir: "/tmp/copilot-config",
           },
         },
-        model: "gpt-5",
+        model: "gpt-4.1",
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         runtimeMode: "approval-required",
         createdAt: now,

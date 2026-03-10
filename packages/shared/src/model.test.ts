@@ -28,7 +28,7 @@ describe("normalizeModelSlug", () => {
   it("preserves non-aliased model slugs", () => {
     expect(normalizeModelSlug("gpt-5.2")).toBe("gpt-5.2");
     expect(normalizeModelSlug("gpt-5.2-codex")).toBe("gpt-5.2-codex");
-    expect(normalizeModelSlug("gpt-5", "copilot")).toBe("gpt-5");
+    expect(normalizeModelSlug("gpt-4.1", "copilot")).toBe("gpt-4.1");
   });
 
   it("does not leak prototype properties as aliases", () => {

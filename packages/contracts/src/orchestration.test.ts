@@ -199,7 +199,7 @@ it.effect("accepts provider-scoped model options in thread.turn.start", () =>
         attachments: [],
       },
         provider: "copilot",
-        model: "gpt-5",
+        model: "gpt-4.1",
         modelOptions: {
           copilot: {
             reasoningEffort: "medium",

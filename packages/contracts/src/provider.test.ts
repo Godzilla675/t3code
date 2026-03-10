@@ -39,7 +39,7 @@ describe("ProviderSessionStartInput", () => {
       threadId: "thread-1",
       provider: "copilot",
       cwd: "/tmp/workspace",
-      model: "gpt-5",
+      model: "gpt-4.1",
       activeTurnId: "turn-1",
       modelOptions: {
         copilot: {
@@ -93,7 +93,7 @@ describe("ProviderSendTurnInput", () => {
   it("accepts copilot-scoped model options", () => {
     const parsed = decodeProviderSendTurnInput({
       threadId: "thread-1",
-      model: "gpt-5",
+      model: "gpt-4.1",
       modelOptions: {
         copilot: {
           reasoningEffort: "low",
@@ -101,7 +101,7 @@ describe("ProviderSendTurnInput", () => {
       },
     });
 
-    expect(parsed.model).toBe("gpt-5");
+    expect(parsed.model).toBe("gpt-4.1");
     expect(parsed.modelOptions?.copilot).toEqual({ reasoningEffort: "low" });
   });
 });

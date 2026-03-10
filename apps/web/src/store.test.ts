@@ -210,7 +210,7 @@ describe("store read model sync", () => {
     const initialState = makeState(makeThread());
     const readModel = makeReadModel(
       makeReadModelThread({
-        model: "gpt-5",
+        model: "gpt-4.1",
         session: {
           threadId: ThreadId.makeUnsafe("thread-1"),
           status: "running",
@@ -225,7 +225,7 @@ describe("store read model sync", () => {
 
     const next = syncServerReadModel(initialState, readModel);
 
-    expect(next.threads[0]?.model).toBe(DEFAULT_MODEL_BY_PROVIDER.copilot);
+    expect(next.threads[0]?.model).toBe("gpt-4.1");
     expect(next.threads[0]?.session?.provider).toBe("copilot");
   });
 
@@ -237,10 +237,10 @@ describe("store read model sync", () => {
     };
     const readModel = makeReadModel(
       makeReadModelThread({
-        model: "gpt-5",
+        model: "claude-sonnet-4.6",
       }),
       {
-        defaultModel: "gpt-5",
+        defaultModel: "claude-sonnet-4.6",
       },
     );
 

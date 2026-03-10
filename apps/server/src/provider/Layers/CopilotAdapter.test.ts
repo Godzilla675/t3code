@@ -222,7 +222,7 @@ layer("CopilotAdapterLive", (it) => {
         provider: "copilot",
         threadId: asThreadId("thread-1"),
         cwd: "/workspaces/t3code",
-        model: "gpt-5",
+        model: "gpt-4.1",
         modelOptions: {
           copilot: {
             reasoningEffort: "medium",
@@ -241,7 +241,7 @@ layer("CopilotAdapterLive", (it) => {
       assert.equal(client.createSessionImpl.mock.calls.length, 1);
       assert.equal(client.resumeSessionImpl.mock.calls.length, 0);
       assert.equal(client.lastCreateConfig?.sessionId, "thread-1");
-      assert.equal(client.lastCreateConfig?.model, "gpt-5");
+      assert.equal(client.lastCreateConfig?.model, "gpt-4.1");
       assert.equal(client.lastCreateConfig?.reasoningEffort, "medium");
       assert.equal(client.lastCreateConfig?.configDir, "/tmp/copilot-config");
       assert.equal(client.lastCreateConfig?.workingDirectory, "/workspaces/t3code");
@@ -328,7 +328,7 @@ layer("CopilotAdapterLive", (it) => {
       yield* adapter.startSession({
         provider: "copilot",
         threadId: asThreadId("thread-send"),
-        model: "gpt-5",
+        model: "gpt-4.1",
         runtimeMode: "full-access",
       });
 
@@ -553,7 +553,7 @@ layer("CopilotAdapterLive", (it) => {
       yield* adapter.startSession({
         provider: "copilot",
         threadId: asThreadId("thread-set-model-failure"),
-        model: "gpt-5",
+        model: "gpt-4.1",
         runtimeMode: "full-access",
       });
       yield* drainStartupEvents(adapter);
@@ -585,7 +585,7 @@ layer("CopilotAdapterLive", (it) => {
 
       const sessions = yield* adapter.listSessions();
       assert.equal(sessions.length, 1);
-      assert.equal(sessions[0]?.model, "gpt-5");
+      assert.equal(sessions[0]?.model, "gpt-4.1");
     }),
   );
 
@@ -603,7 +603,7 @@ layer("CopilotAdapterLive", (it) => {
       yield* adapter.startSession({
         provider: "copilot",
         threadId: asThreadId("thread-restart-failure"),
-        model: "gpt-5",
+        model: "gpt-4.1",
         runtimeMode: "full-access",
       });
 
@@ -623,7 +623,7 @@ layer("CopilotAdapterLive", (it) => {
       const sessions = yield* adapter.listSessions();
       assert.equal(sessions.length, 1);
       assert.equal(sessions[0]?.threadId, "thread-restart-failure");
-      assert.equal(sessions[0]?.model, "gpt-5");
+      assert.equal(sessions[0]?.model, "gpt-4.1");
     }).pipe(
       Effect.provide(
         makeCopilotAdapterLive({
@@ -649,7 +649,7 @@ layer("CopilotAdapterLive", (it) => {
       yield* adapter.startSession({
         provider: "copilot",
         threadId: asThreadId("thread-restart-warning"),
-        model: "gpt-5",
+        model: "gpt-4.1",
         runtimeMode: "full-access",
       });
 
@@ -879,7 +879,7 @@ layer("CopilotAdapterLive", (it) => {
       yield* adapter.startSession({
         provider: "copilot",
         threadId: asThreadId("thread-events"),
-        model: "gpt-5",
+        model: "gpt-4.1",
         runtimeMode: "full-access",
       });
       yield* drainStartupEvents(adapter);

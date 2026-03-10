@@ -24,7 +24,7 @@ describe("normalizeCustomModelSlugs", () => {
   });
 
   it("filters built-in Copilot models from custom entries", () => {
-    expect(normalizeCustomModelSlugs([" gpt-5 ", "custom/copilot-model"], "copilot")).toEqual([
+    expect(normalizeCustomModelSlugs([" gpt-4.1 ", "custom/copilot-model"], "copilot")).toEqual([
       "custom/copilot-model",
     ]);
   });
@@ -57,7 +57,27 @@ describe("getAppModelOptions", () => {
   it("returns Copilot built-ins before custom Copilot models", () => {
     const options = getAppModelOptions("copilot", ["custom/copilot-model"]);
 
-    expect(options.map((option) => option.slug)).toEqual(["gpt-5", "custom/copilot-model"]);
+    expect(options.map((option) => option.slug)).toEqual([
+      "claude-sonnet-4.6",
+      "claude-sonnet-4.5",
+      "claude-haiku-4.5",
+      "claude-opus-4.6",
+      "claude-opus-4.6-fast",
+      "claude-opus-4.5",
+      "claude-sonnet-4",
+      "gemini-3-pro-preview",
+      "gpt-5.4",
+      "gpt-5.3-codex",
+      "gpt-5.2-codex",
+      "gpt-5.2",
+      "gpt-5.1-codex-max",
+      "gpt-5.1-codex",
+      "gpt-5.1",
+      "gpt-5.1-codex-mini",
+      "gpt-5-mini",
+      "gpt-4.1",
+      "custom/copilot-model",
+    ]);
   });
 
   it("prefers runtime Copilot models over the static built-in fallback", () => {
@@ -102,7 +122,7 @@ describe("resolveAppModelSelection", () => {
 
   it("falls back to the provider default when no model is selected", () => {
     expect(resolveAppModelSelection("codex", [], "")).toBe("gpt-5.4");
-    expect(resolveAppModelSelection("copilot", [], "")).toBe("gpt-5");
+    expect(resolveAppModelSelection("copilot", [], "")).toBe("claude-sonnet-4.6");
   });
 
   it("falls back to the first runtime Copilot model when one is available", () => {
@@ -125,13 +145,13 @@ describe("inferProviderForAppModel", () => {
     expect(
       inferProviderForAppModel(
         { customCodexModels: [], customCopilotModels: [] },
-        "gpt-5",
+        "claude-sonnet-4.6",
       ),
     ).toBe("copilot");
     expect(
       inferProviderForAppModel(
         { customCodexModels: [], customCopilotModels: [] },
-        "gpt-5.4",
+        "gpt-5.3-codex-spark",
       ),
     ).toBe("codex");
   });

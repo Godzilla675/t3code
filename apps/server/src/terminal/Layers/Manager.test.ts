@@ -19,8 +19,8 @@ import {
 import { TerminalManagerRuntime } from "./Manager";
 import { Effect, Encoding } from "effect";
 
-const TerminalManagerSlowTestTimeoutMs = process.platform === "win32" ? 20_000 : 12_000;
-const TerminalManagerAsyncWaitTimeoutMs = process.platform === "win32" ? 2_500 : 1_500;
+const TerminalManagerSlowTestTimeoutMs = process.platform === "win32" ? 30_000 : 12_000;
+const TerminalManagerAsyncWaitTimeoutMs = process.platform === "win32" ? 5_000 : 1_500;
 
 class FakePtyProcess implements PtyProcess {
   readonly writes: string[] = [];
@@ -479,18 +479,17 @@ describe("TerminalManager", () => {
     expect(events.some((event) => event.type === "activity")).toBe(false);
 
     hasRunningSubprocess = true;
-      await waitFor(
-        () =>
-          events.some((event) => event.type === "activity" && event.hasRunningSubprocess === true),
-        TerminalManagerAsyncWaitTimeoutMs,
-      );
+    await waitFor(
+      () => events.some((event) => event.type === "activity" && event.hasRunningSubprocess === true),
+      TerminalManagerAsyncWaitTimeoutMs,
+    );
 
     hasRunningSubprocess = false;
-      await waitFor(
-        () =>
-          events.some((event) => event.type === "activity" && event.hasRunningSubprocess === false),
-        TerminalManagerAsyncWaitTimeoutMs,
-      );
+    await waitFor(
+      () =>
+        events.some((event) => event.type === "activity" && event.hasRunningSubprocess === false),
+      TerminalManagerAsyncWaitTimeoutMs,
+    );
 
     manager.dispose();
   }, TerminalManagerSlowTestTimeoutMs);

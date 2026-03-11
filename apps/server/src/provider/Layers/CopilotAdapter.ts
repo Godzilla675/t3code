@@ -187,6 +187,7 @@ export interface CopilotAdapterLiveOptions {
     readonly attachment: ChatAttachment;
   }) => string | null;
   readonly fileExists?: (path: string) => boolean;
+  readonly interactiveRequestTimeoutMs?: number;
 }
 
 interface PendingApprovalRequest {
@@ -197,6 +198,7 @@ interface PendingApprovalRequest {
   readonly request: CopilotPermissionRequest;
   readonly resolve: (result: CopilotPermissionResult) => void;
   readonly reject: (reason?: unknown) => void;
+  readonly timeoutHandle?: ReturnType<typeof setTimeout>;
 }
 
 interface PendingUserInput {
@@ -206,6 +208,7 @@ interface PendingUserInput {
   readonly request: CopilotUserInputRequest;
   readonly resolve: (result: CopilotUserInputResponse) => void;
   readonly reject: (reason?: unknown) => void;
+  readonly timeoutHandle?: ReturnType<typeof setTimeout>;
 }
 
 interface ToolLifecycleState {
@@ -245,6 +248,7 @@ const PROVIDER = "copilot" as const;
 const CLIENT_NAME = "t3code";
 const DEFAULT_QUESTION_ID = "response";
 const TOOL_ONLY_TURN_COMPLETION_GRACE_MS = 250;
+const INTERACTIVE_REQUEST_TIMEOUT_MS = 5 * 60_000;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -345,6 +349,22 @@ function buildSdkRaw(event: CopilotSessionEvent): ProviderRuntimeEvent["raw"] {
 
 function toRuntimeErrorClass(_errorType: string | undefined): RuntimeErrorClass {
   return "provider_error";
+}
+
+function clearPendingTimeout(
+  pending: Pick<PendingApprovalRequest, "timeoutHandle"> | Pick<PendingUserInput, "timeoutHandle">,
+): void {
+  if (pending.timeoutHandle !== undefined) {
+    clearTimeout(pending.timeoutHandle);
+  }
+}
+
+function makeDeterministicHistoryTurnId(
+  event: Pick<CopilotSessionEvent, "id">,
+  turnIndex: number,
+): TurnId {
+  const eventId = asTrimmedString(event.id);
+  return TurnId.makeUnsafe(eventId ? `history:${turnIndex}:${eventId}` : `history:${turnIndex}`);
 }
 
 function toRequestType(request: CopilotPermissionRequest): CanonicalRequestType {
@@ -605,9 +625,13 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
     const nativeEventLogger = options?.nativeEventLogger;
     const resolveAttachmentPath = options?.resolveAttachmentPath ?? defaultResolveAttachmentPath;
     const fileExists = options?.fileExists ?? existsSync;
+    const interactiveRequestTimeoutMs =
+      options?.interactiveRequestTimeoutMs ?? INTERACTIVE_REQUEST_TIMEOUT_MS;
 
     const runDetached = (effect: Effect.Effect<unknown>) => {
-      void Effect.runPromise(effect).catch(() => undefined);
+      void Effect.runPromise(effect).catch((error) => {
+        console.error("[CopilotAdapter] runDetached failure", error);
+      });
     };
 
     const writeNativeEvent = (threadId: ThreadId, event: unknown) =>
@@ -800,6 +824,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
       const events: ProviderRuntimeEvent[] = [];
 
       for (const pending of input.entry.pendingApprovals.values()) {
+        clearPendingTimeout(pending);
         pending.reject(new Error(input.reason));
         events.push({
           ...makeRuntimeEventBase({
@@ -828,6 +853,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
       }
 
       for (const pending of input.entry.pendingUserInputs.values()) {
+        clearPendingTimeout(pending);
         pending.reject(new Error(input.reason));
         events.push({
           ...makeRuntimeEventBase({
@@ -1679,7 +1705,61 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           const requestId = generateId();
           const runtimeRequestId = RuntimeRequestId.makeUnsafe(requestId);
           const deferred = makeDeferred<CopilotPermissionResult>();
-          const pending: PendingApprovalRequest = {
+          let pending!: PendingApprovalRequest;
+          const timeoutReason = "Copilot approval request timed out before the user responded.";
+          const timeoutHandle = setTimeout(() => {
+            const currentEntry = entryRef;
+            if (!currentEntry) {
+              return;
+            }
+            const activePending = currentEntry.pendingApprovals.get(requestId);
+            if (activePending !== pending) {
+              return;
+            }
+            currentEntry.pendingApprovals.delete(requestId);
+            clearPendingTimeout(activePending);
+            activePending.reject(new Error(timeoutReason));
+            const createdAt = now();
+            runDetached(
+              writeNativeEvent(currentEntry.threadId, {
+                source: "copilot.sdk.permission-request",
+                payload: {
+                  request,
+                  reason: timeoutReason,
+                },
+              }).pipe(
+                Effect.andThen(
+                  emitRuntimeEvents([
+                    {
+                      ...makeRuntimeEventBase({
+                        threadId: currentEntry.threadId,
+                        createdAt,
+                        turnId: activePending.turnId,
+                        requestId: runtimeRequestId,
+                        raw: {
+                          source: "copilot.sdk.permission-request",
+                          payload: {
+                            request,
+                            reason: timeoutReason,
+                          },
+                        },
+                      }),
+                      type: "request.resolved",
+                      payload: {
+                        requestType: activePending.requestType,
+                        decision: "cancel",
+                        resolution: {
+                          decision: "cancel",
+                          reason: timeoutReason,
+                        },
+                      },
+                    },
+                  ]),
+                ),
+              ),
+            );
+          }, interactiveRequestTimeoutMs);
+          pending = {
             requestId,
             runtimeRequestId,
             ...(entry.activeTurnId !== undefined ? { turnId: entry.activeTurnId } : {}),
@@ -1687,6 +1767,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
             request,
             resolve: deferred.resolve,
             reject: deferred.reject,
+            timeoutHandle,
           };
           entry.pendingApprovals.set(requestId, pending);
 
@@ -1738,13 +1819,63 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           const requestId = generateId();
           const runtimeRequestId = RuntimeRequestId.makeUnsafe(requestId);
           const deferred = makeDeferred<CopilotUserInputResponse>();
-          const pending: PendingUserInput = {
+          let pending!: PendingUserInput;
+          const timeoutReason = "Copilot user input request timed out before the user responded.";
+          const timeoutHandle = setTimeout(() => {
+            const currentEntry = entryRef;
+            if (!currentEntry) {
+              return;
+            }
+            const activePending = currentEntry.pendingUserInputs.get(requestId);
+            if (activePending !== pending) {
+              return;
+            }
+            currentEntry.pendingUserInputs.delete(requestId);
+            clearPendingTimeout(activePending);
+            activePending.reject(new Error(timeoutReason));
+            const createdAt = now();
+            runDetached(
+              writeNativeEvent(currentEntry.threadId, {
+                source: "copilot.sdk.user-input-request",
+                payload: {
+                  request,
+                  reason: timeoutReason,
+                },
+              }).pipe(
+                Effect.andThen(
+                  emitRuntimeEvents([
+                    {
+                      ...makeRuntimeEventBase({
+                        threadId: currentEntry.threadId,
+                        createdAt,
+                        turnId: activePending.turnId,
+                        requestId: runtimeRequestId,
+                        raw: {
+                          source: "copilot.sdk.user-input-request",
+                          payload: {
+                            request,
+                            reason: timeoutReason,
+                          },
+                        },
+                      }),
+                      type: "user-input.resolved",
+                      payload: {
+                        answers: {},
+                      },
+                    },
+                  ]),
+                ),
+              ),
+            );
+          }, interactiveRequestTimeoutMs);
+          pending = {
             requestId,
             runtimeRequestId,
             ...(entry.activeTurnId !== undefined ? { turnId: entry.activeTurnId } : {}),
             request,
             resolve: deferred.resolve,
             reject: deferred.reject,
+            timeoutHandle,
           };
           entry.pendingUserInputs.set(requestId, pending);
 
@@ -2042,6 +2173,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
         );
 
         const nextModel = input.model;
+        let emittedTurnStarted = false;
         const sendTurnEffect =
           (nextModel !== undefined && nextModel !== previousModel
             ? Effect.tryPromise({
@@ -2067,7 +2199,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                       : {}),
                   },
                 },
-              ]),
+              ]).pipe(Effect.tap(() => Effect.sync(() => (emittedTurnStarted = true)))),
             ),
             Effect.andThen(
               Effect.tryPromise({
@@ -2096,20 +2228,22 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 ? error.detail
                 : "Failed to send Copilot turn.";
               touchSession(entry, { status: "error", activeTurnId: undefined, lastError: detail }, now());
-              yield* emitRuntimeEvents([
-                {
-                  ...makeRuntimeEventBase({
-                    threadId: input.threadId,
-                    createdAt: now(),
-                    turnId,
-                  }),
-                  type: "turn.completed",
-                  payload: {
-                    state: "failed",
-                    errorMessage: detail,
+              if (emittedTurnStarted) {
+                yield* emitRuntimeEvents([
+                  {
+                    ...makeRuntimeEventBase({
+                      threadId: input.threadId,
+                      createdAt: now(),
+                      turnId,
+                    }),
+                    type: "turn.completed",
+                    payload: {
+                      state: "failed",
+                      errorMessage: detail,
+                    },
                   },
-                },
-              ]);
+                ]);
+              }
               return yield* (Schema.is(ProviderAdapterRequestError)(error)
                 ? error
                 : toRequestError("session.send", detail, error));
@@ -2121,19 +2255,37 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
     const interruptTurn: CopilotAdapterShape["interruptTurn"] = (threadId, _turnId) =>
       Effect.gen(function* () {
         const entry = yield* requireEntry(threadId);
+        if (
+          _turnId !== undefined &&
+          (entry.activeTurnId === undefined || String(entry.activeTurnId) !== String(_turnId))
+        ) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "interruptTurn",
+            issue: `Cannot interrupt turn '${String(_turnId)}' because it is not the active Copilot turn.`,
+          });
+        }
+        let abortError: ProviderAdapterRequestError | undefined;
         yield* Effect.tryPromise({
           try: () => entry.session.abort(),
           catch: (cause) => toRequestError("session.abort", "Failed to interrupt Copilot turn.", cause),
-        });
+        }).pipe(
+          Effect.catch((error: ProviderAdapterRequestError) =>
+            Effect.sync(() => {
+              abortError = error;
+            }),
+          ),
+        );
         const createdAt = now();
         const cancelledEvents = cancelPendingInteractiveRequests({
           entry,
           createdAt,
           reason: "Copilot turn interrupted before the interactive request was resolved.",
         });
+        const runtimeEvents: ProviderRuntimeEvent[] = [];
         if (entry.activeTurnId !== undefined) {
           const { turnId, providerTurnId } = clearTurnState(entry, { status: "ready" }, createdAt);
-          yield* emitRuntimeEvents([
+          runtimeEvents.push(
             ...cancelledEvents,
             {
               ...makeRuntimeEventBase({
@@ -2147,12 +2299,17 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 reason: "Copilot turn interrupted",
               },
             },
-          ]);
-          return;
+          );
+        } else {
+          runtimeEvents.push(...cancelledEvents);
         }
 
-        if (cancelledEvents.length > 0) {
-          yield* emitRuntimeEvents(cancelledEvents);
+        if (runtimeEvents.length > 0) {
+          yield* emitRuntimeEvents(runtimeEvents);
+        }
+
+        if (abortError) {
+          return yield* abortError;
         }
       });
 
@@ -2168,6 +2325,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
         }
 
         entry.pendingApprovals.delete(requestId);
+        clearPendingTimeout(pending);
         pending.resolve(toRequestDecision(decision));
 
         yield* emitRuntimeEvents([
@@ -2231,6 +2389,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
         }
 
         entry.pendingUserInputs.delete(requestId);
+        clearPendingTimeout(pending);
         pending.resolve({
           answer,
           wasFreeform: !isChoiceAnswer(pending.request, answer),
@@ -2291,7 +2450,9 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
         for (const event of events) {
           const eventData = event.data ?? {};
           if (event.type === "assistant.turn_start") {
-            const providerTurnId = asTrimmedString(eventData.turnId) ?? generateId();
+            const providerTurnId =
+              asTrimmedString(eventData.turnId) ??
+              String(makeDeterministicHistoryTurnId(event, turns.length + 1));
             if (currentTurn && currentTurn.items.length > 0) {
               turns.push(currentTurn);
             }
@@ -2304,7 +2465,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
 
           if (!currentTurn) {
             currentTurn = {
-              id: TurnId.makeUnsafe(`history:${turns.length + 1}:${generateId()}`),
+              id: makeDeterministicHistoryTurnId(event, turns.length + 1),
               items: [],
             };
           }

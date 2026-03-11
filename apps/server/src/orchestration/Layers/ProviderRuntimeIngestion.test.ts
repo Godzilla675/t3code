@@ -280,6 +280,66 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("turn failed");
   });
 
+  it("finalizes buffered assistant output and clears lifecycle state on turn abort", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-abort-buffer"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-abort-buffer"),
+    });
+
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.session?.status === "running" && thread.session?.activeTurnId === "turn-abort-buffer",
+    );
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-message-delta-abort-buffer"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-abort-buffer"),
+      itemId: asItemId("item-abort-buffer"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "buffer on abort",
+      },
+    });
+    harness.emit({
+      type: "turn.aborted",
+      eventId: asEventId("evt-turn-aborted-buffer"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-abort-buffer"),
+    });
+
+    const thread = await waitForThread(
+      harness.engine,
+      (entry) =>
+        entry.session?.status === "ready" &&
+        entry.session?.activeTurnId === null &&
+        entry.messages.some(
+          (message: ProviderRuntimeTestMessage) =>
+            message.id === "assistant:item-abort-buffer" &&
+            message.text === "buffer on abort" &&
+            !message.streaming,
+        ),
+    );
+    const message = thread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-abort-buffer",
+    );
+    expect(message?.text).toBe("buffer on abort");
+    expect(message?.streaming).toBe(false);
+  });
+
   it("ignores stale runtime lifecycle events from a provider that no longer owns the thread", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();

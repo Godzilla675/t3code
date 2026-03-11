@@ -622,6 +622,60 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
 
+  it("preserves persisted Copilot model options when a runtime-mode restart omits new model options", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-runtime-mode-copilot-1"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-runtime-mode-copilot-1"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        provider: "copilot",
+        model: "gpt-5.4",
+        modelOptions: {
+          copilot: {
+            reasoningEffort: "high",
+          },
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.makeUnsafe("cmd-runtime-mode-set-copilot-model-options"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        runtimeMode: "full-access",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    expect(harness.startSession.mock.calls[1]?.[1]).toMatchObject({
+      provider: "copilot",
+      resumeCursor: { opaque: "cursor-1" },
+      runtimeMode: "full-access",
+      modelOptions: {
+        copilot: {
+          reasoningEffort: "high",
+        },
+      },
+    });
+  });
+
   it("restarts the provider session when provider runtime options change", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();

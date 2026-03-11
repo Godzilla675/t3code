@@ -110,15 +110,84 @@ describe("getCodexCliLaunchSpec", () => {
 
         const launch = getCodexCliLaunchSpec({
           platform: "win32",
-          env: { PATH: `${firstDir};${secondDir}` },
+          env: { PATH: `${firstDir};${secondDir}`, ComSpec: "C:\\Windows\\System32\\cmd.exe" },
           args: ["--version"],
           binaryPath: "codex",
         });
 
-        assert.equal(launch.command, "codex");
-        assert.deepEqual(launch.args, ["--version"]);
-        assert.equal(launch.shell, true);
+        assert.equal(launch.command, "C:\\Windows\\System32\\cmd.exe");
+        assert.deepEqual(launch.args.slice(0, 3), ["/d", "/s", "/c"]);
+        assert.equal(launch.args[3]?.toLowerCase(), path.join(firstDir, "codex.cmd").toLowerCase());
+        assert.deepEqual(launch.args.slice(4), ["--version"]);
+        assert.equal(launch.shell, false);
       });
+    });
+  });
+
+  it("runs discovered cmd wrappers without shell mode on win32", () => {
+    withTempDir((dir) => {
+      const cmdPath = path.join(dir, "codex.cmd");
+      fs.writeFileSync(cmdPath, "@echo off\r\n", "utf8");
+
+      const launch = getCodexCliLaunchSpec({
+        platform: "win32",
+        env: { PATH: dir, ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+        args: ["exec", "--help"],
+        binaryPath: "codex",
+      });
+
+      assert.equal(launch.command, "C:\\Windows\\System32\\cmd.exe");
+      assert.deepEqual(launch.args.slice(0, 3), ["/d", "/s", "/c"]);
+      assert.equal(launch.args[3]?.toLowerCase(), cmdPath.toLowerCase());
+      assert.deepEqual(launch.args.slice(4), ["exec", "--help"]);
+      assert.equal(launch.shell, false);
+    });
+  });
+
+  it("runs discovered powershell wrappers without shell mode on win32", () => {
+    withTempDir((dir) => {
+      const scriptPath = path.join(dir, "codex.ps1");
+      fs.writeFileSync(scriptPath, "Write-Output 'codex'\n", "utf8");
+
+      const launch = getCodexCliLaunchSpec({
+        platform: "win32",
+        env: { PATH: dir },
+        args: ["--version"],
+        binaryPath: "codex",
+      });
+
+      assert.ok(launch.command.toLowerCase().endsWith("powershell.exe"));
+      assert.deepEqual(launch.args, [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        scriptPath,
+        "--version",
+      ]);
+      assert.equal(launch.shell, false);
+    });
+  });
+
+  it("runs direct codex.exe paths without shell mode on win32", () => {
+    withTempDir((dir) => {
+      const spacedDir = path.join(dir, "with space");
+      fs.mkdirSync(spacedDir, { recursive: true });
+      const exePath = path.join(spacedDir, "codex.exe");
+      fs.writeFileSync(exePath, "", "utf8");
+
+      const launch = getCodexCliLaunchSpec({
+        platform: "win32",
+        env: { PATH: "" },
+        args: ["app-server"],
+        binaryPath: exePath,
+      });
+
+      assert.equal(launch.command, exePath);
+      assert.deepEqual(launch.args, ["app-server"]);
+      assert.equal(launch.shell, false);
     });
   });
 });

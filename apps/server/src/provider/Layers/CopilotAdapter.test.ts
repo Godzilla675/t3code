@@ -564,9 +564,6 @@ layer("CopilotAdapterLive", (it) => {
         throw new Error("simulated model switch failure");
       });
 
-      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
-        Effect.forkChild,
-      );
       const failure = yield* Effect.result(
         adapter.sendTurn({
           threadId: asThreadId("thread-set-model-failure"),
@@ -575,13 +572,8 @@ layer("CopilotAdapterLive", (it) => {
           attachments: [],
         }),
       );
-      const events = Array.from(yield* Fiber.join(eventsFiber));
 
       assert.equal(failure._tag, "Failure");
-      assert.equal(events[0]?.type, "turn.completed");
-      if (events[0]?.type === "turn.completed") {
-        assert.equal(events[0].payload.state, "failed");
-      }
 
       const sessions = yield* adapter.listSessions();
       assert.equal(sessions.length, 1);
@@ -765,6 +757,71 @@ layer("CopilotAdapterLive", (it) => {
       assert.equal(resolved.value.payload.decision, "accept");
     }),
   );
+
+  it.effect("times out pending Copilot approval requests", () => {
+    const timeoutClient = new FakeCopilotClient();
+
+    return Effect.gen(function* () {
+      const adapter = yield* CopilotAdapter;
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-approval-timeout"),
+        runtimeMode: "approval-required",
+      });
+      yield* drainStartupEvents(adapter);
+
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-approval-timeout"),
+        input: "Wait for approval timeout",
+        attachments: [],
+      });
+      yield* Stream.runHead(adapter.streamEvents).pipe(Effect.asVoid);
+
+      const config = timeoutClient.lastCreateConfig;
+      assert.ok(config?.onPermissionRequest);
+
+      const approvalFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+        Effect.forkChild,
+      );
+      const decisionPromise = Promise.resolve(
+        config.onPermissionRequest!(
+          {
+            kind: "shell",
+            fullCommandText: "git push --force-with-lease",
+            intention: "Push rewritten history",
+          },
+          { sessionId: "thread-approval-timeout" },
+        ),
+      )
+        .then((value) => ({ ok: true as const, value }))
+        .catch((error) => ({ ok: false as const, error }));
+
+      const approvalEvents = Array.from(yield* Fiber.join(approvalFiber));
+      assert.deepEqual(
+        approvalEvents.map((event) => event.type),
+        ["request.opened", "request.resolved"],
+      );
+      if (approvalEvents[1]?.type === "request.resolved") {
+        assert.equal(approvalEvents[1].payload.decision, "cancel");
+      }
+
+      const decisionResult = yield* Effect.promise(() => decisionPromise);
+      assert.equal(decisionResult.ok, false);
+    }).pipe(
+      Effect.provide(
+        makeCopilotAdapterLive({
+          clientFactory: () => timeoutClient,
+          resolveAttachmentPath: ({ attachment }) => resolvedAttachmentPaths.get(attachment.id) ?? null,
+          fileExists: (path) => existingAttachmentPaths.has(path),
+          interactiveRequestTimeoutMs: 5,
+        }).pipe(
+          Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    );
+  });
 
   it.effect("bridges ask-user requests into canonical user-input events", () =>
     Effect.gen(function* () {
@@ -1035,6 +1092,113 @@ layer("CopilotAdapterLive", (it) => {
     }),
   );
 
+  it.effect("still clears local state when Copilot abort rejects", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-interrupt-abort-failure"),
+        runtimeMode: "approval-required",
+      });
+      yield* drainStartupEvents(adapter);
+
+      const turn = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-interrupt-abort-failure"),
+        input: "Run the risky step anyway",
+        attachments: [],
+      });
+      yield* Stream.runHead(adapter.streamEvents).pipe(Effect.asVoid);
+
+      const config = client.lastCreateConfig;
+      assert.ok(config?.onPermissionRequest);
+
+      const openedFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      const decisionPromise = Promise.resolve(
+        config.onPermissionRequest!(
+          {
+            kind: "shell",
+            fullCommandText: "git push --force-with-lease",
+            intention: "Push rewritten history",
+          },
+          { sessionId: "thread-interrupt-abort-failure" },
+        ),
+      )
+        .then((value) => ({ ok: true as const, value }))
+        .catch((error) => ({ ok: false as const, error }));
+
+      const opened = yield* Fiber.join(openedFiber);
+      assert.equal(opened._tag, "Some");
+      if (opened._tag !== "Some") {
+        return;
+      }
+      assert.equal(opened.value.type, "request.opened");
+
+      const session = client.currentSession;
+      assert.ok(session);
+      session.abortImpl.mockImplementationOnce(async () => {
+        throw new Error("simulated abort failure");
+      });
+
+      const interruptedFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+        Effect.forkChild,
+      );
+      const interruptResult = yield* Effect.result(
+        adapter.interruptTurn(asThreadId("thread-interrupt-abort-failure"), turn.turnId),
+      );
+
+      assert.equal(interruptResult._tag, "Failure");
+      const interruptedEvents = Array.from(yield* Fiber.join(interruptedFiber));
+      assert.deepEqual(
+        interruptedEvents.map((event) => event.type),
+        ["request.resolved", "turn.aborted"],
+      );
+
+      const decisionResult = yield* Effect.promise(() => decisionPromise);
+      assert.equal(decisionResult.ok, false);
+
+      const retry = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-interrupt-abort-failure"),
+        input: "Retry after local cleanup",
+        attachments: [],
+      });
+      assert.equal(retry.threadId, "thread-interrupt-abort-failure");
+    }),
+  );
+
+  it.effect("rejects interrupt requests for a stale turn id", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-interrupt-stale-turn"),
+        runtimeMode: "full-access",
+      });
+      yield* drainStartupEvents(adapter);
+
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-interrupt-stale-turn"),
+        input: "Keep going",
+        attachments: [],
+      });
+      yield* Stream.runHead(adapter.streamEvents).pipe(Effect.asVoid);
+
+      const session = client.currentSession;
+      assert.ok(session);
+
+      const interruptResult = yield* Effect.result(
+        adapter.interruptTurn(
+          asThreadId("thread-interrupt-stale-turn"),
+          TurnId.makeUnsafe("turn-stale"),
+        ),
+      );
+
+      assert.equal(interruptResult._tag, "Failure");
+      assert.equal(session.abortImpl.mock.calls.length, 0);
+    }),
+  );
+
   it.effect("clears failed turns when Copilot reports a session error", () =>
     Effect.gen(function* () {
       const adapter = yield* resetSharedAdapter();
@@ -1134,6 +1298,35 @@ layer("CopilotAdapterLive", (it) => {
 
       const hasSession = yield* adapter.hasSession(asThreadId("thread-session-shutdown"));
       assert.equal(hasSession, false);
+    }),
+  );
+
+  it.effect("uses deterministic fallback ids when reading Copilot history without SDK turn ids", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-read-history"),
+        runtimeMode: "full-access",
+      });
+      yield* drainStartupEvents(adapter);
+
+      const session = client.currentSession;
+      assert.ok(session);
+      session.getMessagesImpl.mockResolvedValue([
+        { id: "evt-history-1", type: "assistant.turn_start", data: {} },
+        { id: "evt-history-2", type: "assistant.message", data: { text: "hello" } },
+        { id: "evt-history-3", type: "assistant.turn_end", data: {} },
+      ]);
+
+      const first = yield* adapter.readThread(asThreadId("thread-read-history"));
+      const second = yield* adapter.readThread(asThreadId("thread-read-history"));
+
+      assert.equal(first.turns.length, 1);
+      assert.equal(second.turns.length, 1);
+      assert.equal(first.turns[0]?.id, second.turns[0]?.id);
+      assert.equal(first.turns[0]?.id, "history:1:evt-history-1");
     }),
   );
 

@@ -201,6 +201,65 @@ function resolveWindowsCodexPackageRoot(commandPath: string): string | undefined
   return isFile(join(packageRoot, "bin", "codex.js")) ? packageRoot : undefined;
 }
 
+function resolveWindowsCommandProcessor(env: NodeJS.ProcessEnv): string {
+  return env.ComSpec ?? process.env.ComSpec ?? "cmd.exe";
+}
+
+function resolveWindowsPowerShellExecutable(env: NodeJS.ProcessEnv): string {
+  const systemRoot = env.SystemRoot ?? process.env.SystemRoot;
+  if (systemRoot) {
+    const bundledPowerShell = join(
+      systemRoot,
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe",
+    );
+    if (isFile(bundledPowerShell)) {
+      return bundledPowerShell;
+    }
+  }
+
+  return "powershell.exe";
+}
+
+function resolveWindowsDirectLaunchSpec(
+  resolvedCommandPath: string,
+  env: NodeJS.ProcessEnv,
+  args: ReadonlyArray<string>,
+): CodexCliLaunchSpec {
+  switch (extname(resolvedCommandPath).toUpperCase()) {
+    case ".CMD":
+    case ".BAT":
+      return {
+        command: resolveWindowsCommandProcessor(env),
+        args: ["/d", "/s", "/c", resolvedCommandPath, ...args],
+        shell: false,
+      };
+    case ".PS1":
+      return {
+        command: resolveWindowsPowerShellExecutable(env),
+        args: [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          resolvedCommandPath,
+          ...args,
+        ],
+        shell: false,
+      };
+    default:
+      return {
+        command: resolvedCommandPath,
+        args,
+        shell: false,
+      };
+  }
+}
+
 function resolveWindowsCodexNativeLaunchSpec(
   binaryPath: string,
   env: NodeJS.ProcessEnv,
@@ -250,7 +309,7 @@ function resolveWindowsCodexNativeLaunchSpec(
       return {
         ...launch,
         extraEnv: {
-          ...(launch.extraEnv ?? {}),
+          ...launch.extraEnv,
           [managedByEnvVar]: "1",
         },
       };
@@ -286,9 +345,14 @@ export function getCodexCliLaunchSpec(input: CodexCliLaunchInput): CodexCliLaunc
     return nativeLaunch;
   }
 
+  const resolvedCommandPath = resolveFirstWindowsCommandPath(binaryPath, env);
+  if (resolvedCommandPath) {
+    return resolveWindowsDirectLaunchSpec(resolvedCommandPath, env, input.args);
+  }
+
   return {
     command: binaryPath,
     args: input.args,
-    shell: true,
+    shell: false,
   };
 }

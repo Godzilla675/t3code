@@ -229,6 +229,25 @@ function makeFakeCodexAdapter(provider: ProviderKind = "codex") {
 const sleep = (ms: number) =>
   Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
+const waitForEffect = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  predicate: (value: A) => boolean,
+  timeoutMs = 2000,
+) =>
+  Effect.gen(function* () {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const value = yield* effect;
+      if (predicate(value)) {
+        return value;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("Timed out waiting for effect state");
+      }
+      yield* sleep(10);
+    }
+  });
+
 function makeProviderServiceLayer() {
   const codex = makeFakeCodexAdapter();
   const copilot = makeFakeCodexAdapter("copilot");
@@ -574,6 +593,29 @@ it.effect("ProviderServiceLive restores persisted Copilot provider options durin
     }
     assert.equal(secondCopilot.sendTurn.mock.calls.length, 1);
 
+    const persistedAfterRecovery = yield* Effect.gen(function* () {
+      const repository = yield* ProviderSessionRuntimeRepository;
+      return yield* repository.getByThreadId({ threadId: startedSession.threadId });
+    }).pipe(Effect.provide(runtimeRepositoryLayer));
+    assert.equal(Option.isSome(persistedAfterRecovery), true);
+    if (Option.isSome(persistedAfterRecovery)) {
+      const payload = persistedAfterRecovery.value.runtimePayload;
+      assert.equal(payload !== null && typeof payload === "object" && !Array.isArray(payload), true);
+      if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+        assert.deepEqual((payload as { modelOptions?: unknown }).modelOptions, {
+          copilot: {
+            reasoningEffort: "medium",
+          },
+        });
+        assert.deepEqual((payload as { providerOptions?: unknown }).providerOptions, {
+          copilot: {
+            cliUrl: "http://127.0.0.1:8123",
+            configDir: "/tmp/copilot-config",
+          },
+        });
+      }
+    }
+
     fs.rmSync(tempDir, { recursive: true, force: true });
   }).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -777,6 +819,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
   it.effect("routes provider operations and rollback conversation", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
       routing.codex.sendTurn.mockClear();
       routing.codex.interruptTurn.mockClear();
       routing.codex.respondToRequest.mockClear();
@@ -843,6 +886,22 @@ routing.layer("ProviderServiceLive routing", (it) => {
       });
 
       yield* provider.stopSession({ threadId: session.threadId });
+      routing.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-stop-after-remove"),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId: session.threadId,
+        payload: {
+          reason: "late exit after explicit stop",
+          exitKind: "graceful",
+        },
+      });
+      const removedBinding = yield* waitForEffect(
+        directory.getBinding(session.threadId),
+        Option.isNone,
+      );
+      assert.equal(Option.isNone(removedBinding), true);
       const sendAfterStop = yield* Effect.result(
         provider.sendTurn({
           threadId: session.threadId,
@@ -1155,11 +1214,12 @@ routing.layer("ProviderServiceLive routing", (it) => {
           reason: "Copilot crashed",
         },
       });
-      yield* sleep(20);
-
-      const erroredRuntime = yield* runtimeRepository.getByThreadId({
-        threadId: session.threadId,
-      });
+      const erroredRuntime = yield* waitForEffect(
+        runtimeRepository.getByThreadId({
+          threadId: session.threadId,
+        }),
+        (runtime) => Option.isSome(runtime) && runtime.value.status === "error",
+      );
       assert.equal(Option.isSome(erroredRuntime), true);
       if (Option.isSome(erroredRuntime)) {
         assert.equal(erroredRuntime.value.status, "error");
@@ -1187,11 +1247,30 @@ routing.layer("ProviderServiceLive routing", (it) => {
           recoverable: true,
         },
       });
-      yield* sleep(20);
-
-      const exitedRuntime = yield* runtimeRepository.getByThreadId({
-        threadId: session.threadId,
-      });
+      const exitedRuntime = yield* waitForEffect(
+        runtimeRepository.getByThreadId({
+          threadId: session.threadId,
+        }),
+        (runtime) =>
+          Option.isSome(runtime) &&
+          runtime.value.status === "error" &&
+          runtime.value.runtimePayload !== null &&
+          typeof runtime.value.runtimePayload === "object" &&
+          !Array.isArray(runtime.value.runtimePayload) &&
+          Array.isArray(
+            (runtime.value.runtimePayload as { pendingApprovalRequests?: unknown }).pendingApprovalRequests,
+          ) &&
+          Array.isArray(
+            (runtime.value.runtimePayload as { pendingUserInputRequests?: unknown })
+              .pendingUserInputRequests,
+          ) &&
+          ((runtime.value.runtimePayload as { pendingApprovalRequests?: ReadonlyArray<unknown> })
+            .pendingApprovalRequests?.length ??
+            0) === 0 &&
+          ((runtime.value.runtimePayload as { pendingUserInputRequests?: ReadonlyArray<unknown> })
+            .pendingUserInputRequests?.length ??
+            0) === 0,
+      );
       assert.equal(Option.isSome(exitedRuntime), true);
       if (Option.isSome(exitedRuntime)) {
         assert.equal(exitedRuntime.value.status, "error");
@@ -1210,6 +1289,54 @@ routing.layer("ProviderServiceLive routing", (it) => {
           assert.deepEqual(runtimePayload.pendingUserInputRequests ?? [], []);
         }
       }
+    }),
+  );
+
+  it.effect("ignores stale runtime events from a provider that is no longer bound to the thread", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = asThreadId("thread-provider-switch");
+
+      yield* provider.startSession(threadId, {
+        provider: "codex",
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* provider.startSession(threadId, {
+        provider: "copilot",
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const eventsRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
+      const consumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        Ref.update(eventsRef, (current) => [...current, event]),
+      ).pipe(Effect.forkChild);
+      yield* sleep(20);
+
+      routing.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-stale-codex-session-exited"),
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        threadId,
+        payload: {
+          reason: "old provider shutdown",
+          exitKind: "success",
+          recoverable: false,
+        },
+      });
+      yield* sleep(20);
+
+      const events = yield* Ref.get(eventsRef);
+      yield* Fiber.interrupt(consumer);
+
+      assert.equal(
+        events.some((event) => event.eventId === asEventId("evt-stale-codex-session-exited")),
+        false,
+      );
+      assert.equal(yield* directory.getProvider(threadId), "copilot");
     }),
   );
 });

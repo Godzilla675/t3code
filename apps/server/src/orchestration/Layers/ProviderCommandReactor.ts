@@ -249,8 +249,11 @@ const make = Effect.gen(function* () {
       readonly resumeCursor?: unknown;
       readonly provider?: ProviderKind;
       readonly providerOptions?: ProviderStartOptions;
+      readonly modelOptions?: ProviderModelOptions;
     }) => {
       const providerOptions = input?.providerOptions ?? options?.providerOptions;
+      const modelOptions =
+        input?.modelOptions ?? (hasRequestedModelOptions ? options?.modelOptions : undefined);
       return providerService.startSession(threadId, {
         threadId,
         ...(input?.provider ?? preferredProvider
@@ -260,7 +263,7 @@ const make = Effect.gen(function* () {
         ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
         ...(desiredModel ? { model: desiredModel } : {}),
         ...(options?.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
-        ...(hasRequestedModelOptions ? { modelOptions: options?.modelOptions } : {}),
+        ...(modelOptions !== undefined ? { modelOptions } : {}),
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
         runtimeMode: desiredRuntimeMode,
       });
@@ -345,10 +348,13 @@ const make = Effect.gen(function* () {
       });
       const restartProviderOptions =
         options?.providerOptions ?? (!providerChanged ? persistedProviderOptions : undefined);
+      const restartModelOptions =
+        options?.modelOptions ?? (!providerChanged ? persistedModelOptions : undefined);
       const restartedSession = yield* startProviderSession({
         ...(resumeCursor !== undefined ? { resumeCursor } : {}),
         ...(options?.provider !== undefined ? { provider: options.provider } : {}),
         ...(restartProviderOptions !== undefined ? { providerOptions: restartProviderOptions } : {}),
+        ...(restartModelOptions !== undefined ? { modelOptions: restartModelOptions } : {}),
       });
       if (providerChanged && currentProvider !== undefined) {
         yield* providerService

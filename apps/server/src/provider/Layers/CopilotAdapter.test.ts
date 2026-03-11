@@ -681,6 +681,28 @@ layer("CopilotAdapterLive", (it) => {
     );
   });
 
+  it.effect("removes sessions even when stopping the Copilot client reports errors", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-stop-error"),
+        runtimeMode: "full-access",
+      });
+
+      client.stopImpl.mockResolvedValueOnce([new Error("simulated stop failure")]);
+
+      const stopResult = yield* Effect.exit(adapter.stopSession(asThreadId("thread-stop-error")));
+      assert.equal(stopResult._tag, "Failure");
+
+      const hasSession = yield* adapter.hasSession(asThreadId("thread-stop-error"));
+      assert.equal(hasSession, false);
+      const sessions = yield* adapter.listSessions();
+      assert.equal(sessions.length, 0);
+    }),
+  );
+
   it.effect("bridges approval requests into canonical request events", () =>
     Effect.gen(function* () {
       const adapter = yield* resetSharedAdapter();
@@ -782,6 +804,7 @@ layer("CopilotAdapterLive", (it) => {
       }
       assert.equal(opened.value.payload.questions[0]?.id, "response");
       assert.equal(opened.value.payload.questions[0]?.question, "Proceed with the refactor?");
+      assert.equal(opened.value.payload.questions[0]?.allowFreeform, true);
       const userInputRequestId = opened.value.requestId;
       assert.ok(userInputRequestId);
 
@@ -809,6 +832,76 @@ layer("CopilotAdapterLive", (it) => {
       assert.deepEqual(resolved.value.payload.answers, {
         response: "Yes",
       });
+    }),
+  );
+
+  it.effect("rejects freeform answers for choice-only ask-user requests", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-choice-only"),
+        runtimeMode: "approval-required",
+      });
+      yield* drainStartupEvents(adapter);
+
+      const config = client.lastCreateConfig;
+      assert.ok(config);
+      assert.ok(config.onUserInputRequest);
+
+      const openedFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      const answerPromise = Promise.resolve(
+        config.onUserInputRequest!(
+          {
+            question: "Proceed with the refactor?",
+            choices: ["Yes", "No"],
+            allowFreeform: false,
+          },
+          { sessionId: "thread-choice-only" },
+        ),
+      );
+
+      const opened = yield* Fiber.join(openedFiber);
+      assert.equal(opened._tag, "Some");
+      if (opened._tag !== "Some") {
+        return;
+      }
+      assert.equal(opened.value.type, "user-input.requested");
+      if (opened.value.type !== "user-input.requested") {
+        return;
+      }
+      assert.equal(opened.value.payload.questions[0]?.allowFreeform, false);
+      const userInputRequestId = opened.value.requestId;
+      assert.ok(userInputRequestId);
+
+      const invalidResponse = yield* Effect.exit(
+        adapter.respondToUserInput(
+          asThreadId("thread-choice-only"),
+          ApprovalRequestId.makeUnsafe(userInputRequestId),
+          { response: "Maybe" },
+        ),
+      );
+      assert.equal(invalidResponse._tag, "Failure");
+
+      const resolvedFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* adapter.respondToUserInput(
+        asThreadId("thread-choice-only"),
+        ApprovalRequestId.makeUnsafe(userInputRequestId),
+        { response: "Yes" },
+      );
+      const resolved = yield* Fiber.join(resolvedFiber);
+      const answer = yield* Effect.promise(() => answerPromise);
+
+      assert.deepEqual(answer, {
+        answer: "Yes",
+        wasFreeform: false,
+      });
+      assert.equal(resolved._tag, "Some");
+      if (resolved._tag !== "Some") {
+        return;
+      }
+      assert.equal(resolved.value.type, "user-input.resolved");
     }),
   );
 
@@ -848,6 +941,7 @@ layer("CopilotAdapterLive", (it) => {
         return;
       }
       assert.deepEqual(opened.value.payload.questions[0]?.options, []);
+      assert.equal(opened.value.payload.questions[0]?.allowFreeform, true);
       const userInputRequestId = opened.value.requestId;
       assert.ok(userInputRequestId);
 
@@ -869,6 +963,177 @@ layer("CopilotAdapterLive", (it) => {
         return;
       }
       assert.equal(resolved.value.type, "user-input.resolved");
+    }),
+  );
+
+  it.effect("interrupting a turn cancels pending Copilot approvals", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-interrupt-approval"),
+        runtimeMode: "approval-required",
+      });
+      yield* drainStartupEvents(adapter);
+
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-interrupt-approval"),
+        input: "Run the risky step",
+        attachments: [],
+      });
+      yield* Stream.runHead(adapter.streamEvents).pipe(Effect.asVoid);
+
+      const config = client.lastCreateConfig;
+      assert.ok(config);
+      assert.ok(config.onPermissionRequest);
+
+      const openedFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      const decisionPromise = Promise.resolve(
+        config.onPermissionRequest!(
+          {
+            kind: "shell",
+            fullCommandText: "git push --force-with-lease",
+            intention: "Push rewritten history",
+          },
+          { sessionId: "thread-interrupt-approval" },
+        ),
+      )
+        .then((value) => ({ ok: true as const, value }))
+        .catch((error) => ({ ok: false as const, error }));
+
+      const opened = yield* Fiber.join(openedFiber);
+      assert.equal(opened._tag, "Some");
+      if (opened._tag !== "Some") {
+        return;
+      }
+      assert.equal(opened.value.type, "request.opened");
+
+      const interruptedFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+        Effect.forkChild,
+      );
+      yield* adapter.interruptTurn(asThreadId("thread-interrupt-approval"), undefined);
+
+      const interruptedEvents = Array.from(yield* Fiber.join(interruptedFiber));
+      assert.deepEqual(
+        interruptedEvents.map((event) => event.type),
+        ["request.resolved", "turn.aborted"],
+      );
+      if (interruptedEvents[0]?.type === "request.resolved") {
+        assert.equal(interruptedEvents[0].payload.decision, "cancel");
+      }
+
+      const decisionResult = yield* Effect.promise(() => decisionPromise);
+      assert.equal(decisionResult.ok, false);
+
+      const retry = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-interrupt-approval"),
+        input: "Retry after interrupt",
+        attachments: [],
+      });
+      assert.equal(retry.threadId, "thread-interrupt-approval");
+    }),
+  );
+
+  it.effect("clears failed turns when Copilot reports a session error", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-session-error"),
+        runtimeMode: "full-access",
+      });
+      yield* drainStartupEvents(adapter);
+
+      const turn = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-session-error"),
+        input: "Do the first step",
+        attachments: [],
+      });
+      yield* Stream.runHead(adapter.streamEvents).pipe(Effect.asVoid);
+
+      const session = client.currentSession;
+      assert.ok(session);
+
+      const errorFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+        Effect.forkChild,
+      );
+      session.emit({
+        id: "evt-session-error",
+        type: "session.error",
+        data: {
+          message: "Copilot crashed",
+        },
+      });
+
+      const errorEvents = Array.from(yield* Fiber.join(errorFiber));
+      assert.deepEqual(
+        errorEvents.map((event) => event.type),
+        ["runtime.error", "turn.completed", "session.state.changed"],
+      );
+      if (errorEvents[1]?.type === "turn.completed") {
+        assert.equal(errorEvents[1].turnId, turn.turnId);
+        assert.equal(errorEvents[1].payload.state, "failed");
+      }
+
+      const sessions = yield* adapter.listSessions();
+      assert.equal(sessions[0]?.status, "error");
+      assert.equal(sessions[0]?.activeTurnId, undefined);
+
+      const retry = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-session-error"),
+        input: "Retry after crash",
+        attachments: [],
+      });
+      assert.equal(retry.threadId, "thread-session-error");
+    }),
+  );
+
+  it.effect("removes sessions when Copilot reports session shutdown", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-session-shutdown"),
+        runtimeMode: "full-access",
+      });
+      yield* drainStartupEvents(adapter);
+
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-session-shutdown"),
+        input: "Do the first step",
+        attachments: [],
+      });
+      yield* Stream.runHead(adapter.streamEvents).pipe(Effect.asVoid);
+
+      const session = client.currentSession;
+      assert.ok(session);
+
+      const shutdownFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+        Effect.forkChild,
+      );
+      session.emit({
+        id: "evt-session-shutdown",
+        type: "session.shutdown",
+        data: {
+          shutdownType: "error",
+          message: "Copilot exited unexpectedly",
+        },
+      });
+
+      const shutdownEvents = Array.from(yield* Fiber.join(shutdownFiber));
+      assert.deepEqual(
+        shutdownEvents.map((event) => event.type),
+        ["turn.completed", "session.exited"],
+      );
+      if (shutdownEvents[1]?.type === "session.exited") {
+        assert.equal(shutdownEvents[1].payload.exitKind, "error");
+      }
+
+      const hasSession = yield* adapter.hasSession(asThreadId("thread-session-shutdown"));
+      assert.equal(hasSession, false);
     }),
   );
 
@@ -944,6 +1209,197 @@ layer("CopilotAdapterLive", (it) => {
         assert.equal(events[3].turnId, result.turnId);
         assert.equal(events[3].payload.state, "completed");
       }
+    }),
+  );
+
+  it.effect("keeps Copilot tool-only sub-turns on the current orchestration turn until the final answer completes", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-tool-bridge"),
+        model: "gpt-5.4",
+        runtimeMode: "full-access",
+      });
+      yield* drainStartupEvents(adapter);
+
+      const result = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-tool-bridge"),
+        input: "Inspect package.json and summarize the scripts",
+        attachments: [],
+      });
+
+      const session = client.currentSession;
+      assert.ok(session);
+
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 6)).pipe(
+        Effect.forkChild,
+      );
+
+      session.emit({
+        id: "evt-runtime-turn-start-1",
+        type: "assistant.turn_start",
+        data: {
+          turnId: "provider-turn-1",
+        },
+      });
+      session.emit({
+        id: "evt-tool-start-bridge",
+        type: "tool.execution_start",
+        data: {
+          toolCallId: "tool-1",
+          toolName: "view",
+          arguments: {
+            path: "package.json",
+          },
+        },
+      });
+      session.emit({
+        id: "evt-tool-complete-bridge",
+        type: "tool.execution_complete",
+        data: {
+          toolCallId: "tool-1",
+          toolName: "view",
+          success: true,
+          result: {
+            content: "{}",
+          },
+        },
+      });
+      session.emit({
+        id: "evt-runtime-turn-end-1",
+        type: "assistant.turn_end",
+        data: {
+          turnId: "provider-turn-1",
+        },
+      });
+
+      const sessionsDuringBridge = yield* adapter.listSessions();
+      assert.equal(sessionsDuringBridge[0]?.status, "running");
+      assert.equal(sessionsDuringBridge[0]?.activeTurnId, result.turnId);
+
+      session.emit({
+        id: "evt-runtime-turn-start-2",
+        type: "assistant.turn_start",
+        data: {
+          turnId: "provider-turn-2",
+        },
+      });
+      session.emit({
+        id: "evt-message-delta-bridge",
+        type: "assistant.message_delta",
+        data: {
+          messageId: "msg-bridge",
+          deltaContent: "Hello ",
+        },
+      });
+      session.emit({
+        id: "evt-message-bridge",
+        type: "assistant.message",
+        data: {
+          messageId: "msg-bridge",
+          content: "Hello world",
+        },
+      });
+      session.emit({
+        id: "evt-runtime-turn-end-2",
+        type: "assistant.turn_end",
+        data: {
+          turnId: "provider-turn-2",
+        },
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      assert.deepEqual(
+        events.map((event) => event.type),
+        ["turn.started", "item.started", "item.completed", "content.delta", "item.completed", "turn.completed"],
+      );
+      for (const event of events) {
+        if ("turnId" in event && event.turnId !== undefined) {
+          assert.equal(event.turnId, result.turnId);
+        }
+      }
+
+      const sessionsAfterCompletion = yield* adapter.listSessions();
+      assert.equal(sessionsAfterCompletion[0]?.status, "ready");
+      assert.equal(sessionsAfterCompletion[0]?.activeTurnId, undefined);
+    }),
+  );
+
+  it.effect("completes an open Copilot tool turn when the session becomes idle", () =>
+    Effect.gen(function* () {
+      const adapter = yield* resetSharedAdapter();
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId: asThreadId("thread-tool-idle"),
+        model: "gpt-5.4",
+        runtimeMode: "full-access",
+      });
+      yield* drainStartupEvents(adapter);
+
+      const result = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-tool-idle"),
+        input: "Inspect package.json",
+        attachments: [],
+      });
+
+      const session = client.currentSession;
+      assert.ok(session);
+
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 4)).pipe(
+        Effect.forkChild,
+      );
+
+      session.emit({
+        id: "evt-runtime-turn-start-idle",
+        type: "assistant.turn_start",
+        data: {
+          turnId: "provider-turn-idle",
+        },
+      });
+      session.emit({
+        id: "evt-tool-start-idle",
+        type: "tool.execution_start",
+        data: {
+          toolCallId: "tool-idle",
+          toolName: "view",
+          arguments: {
+            path: "package.json",
+          },
+        },
+      });
+      session.emit({
+        id: "evt-runtime-turn-end-idle",
+        type: "assistant.turn_end",
+        data: {
+          turnId: "provider-turn-idle",
+        },
+      });
+
+      const sessionsBeforeIdle = yield* adapter.listSessions();
+      assert.equal(sessionsBeforeIdle[0]?.status, "running");
+      assert.equal(sessionsBeforeIdle[0]?.activeTurnId, result.turnId);
+
+      session.emit({
+        id: "evt-session-idle",
+        type: "session.idle",
+        data: {},
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      assert.deepEqual(
+        events.map((event) => event.type),
+        ["turn.started", "item.started", "turn.completed", "thread.state.changed"],
+      );
+      if (events[2]?.type === "turn.completed") {
+        assert.equal(events[2].turnId, result.turnId);
+      }
+
+      const sessionsAfterIdle = yield* adapter.listSessions();
+      assert.equal(sessionsAfterIdle[0]?.status, "ready");
+      assert.equal(sessionsAfterIdle[0]?.activeTurnId, undefined);
     }),
   );
 

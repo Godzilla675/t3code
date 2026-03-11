@@ -35,6 +35,12 @@ interface WorkspaceIndex {
 const workspaceIndexCache = new Map<string, WorkspaceIndex>();
 const inFlightWorkspaceIndexBuilds = new Map<string, Promise<WorkspaceIndex>>();
 
+/** @internal - Exported for testing */
+export function resetWorkspaceIndexCacheForTesting(): void {
+  workspaceIndexCache.clear();
+  inFlightWorkspaceIndexBuilds.clear();
+}
+
 function toPosixPath(input: string): string {
   return input.split(path.sep).join("/");
 }

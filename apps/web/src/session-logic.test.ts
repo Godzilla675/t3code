@@ -2,6 +2,7 @@ import { EventId, MessageId, TurnId, type OrchestrationThreadActivity } from "@t
 import { describe, expect, it } from "vitest";
 
 import {
+  applyDefaultExpandedWorkGroup,
   deriveActiveWorkStartedAt,
   deriveActivePlanState,
   PROVIDER_OPTIONS,
@@ -9,9 +10,12 @@ import {
   derivePendingUserInputs,
   deriveTimelineEntries,
   deriveWorkLogEntries,
+  findWorkGroupIdBeforeEntry,
   findLatestProposedPlan,
   hasToolActivityForTurn,
   isLatestTurnSettled,
+  resolveAssistantDeliveryModeForProvider,
+  toggleWorkGroupExpansion,
 } from "./session-logic";
 
 function makeActivity(overrides: {
@@ -91,17 +95,61 @@ describe("derivePendingApprovals", () => {
         payload: {
           requestId: "req-request-type",
           requestType: "command_execution_approval",
-          detail: "pwd",
+        detail: "pwd",
+      },
+    }),
+  ];
+
+  expect(derivePendingApprovals(activities)).toEqual([
+      {
+        requestId: "req-request-type",
+        requestKind: "command",
+        createdAt: "2026-02-23T00:00:01.000Z",
+      detail: "pwd",
+    },
+  ]);
+});
+
+  it("keeps tool-call and auth approvals visible for canonical request types", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "approval-open-tool-call",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "approval.requested",
+        summary: "Tool approval requested",
+        tone: "approval",
+        payload: {
+          requestId: "req-tool-call",
+          requestType: "dynamic_tool_call",
+          detail: "Fetch release notes from GitHub",
+        },
+      }),
+      makeActivity({
+        id: "approval-open-auth",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "approval.requested",
+        summary: "Auth approval requested",
+        tone: "approval",
+        payload: {
+          requestId: "req-auth",
+          requestType: "auth_tokens_refresh",
+          detail: "Refresh GitHub access token",
         },
       }),
     ];
 
     expect(derivePendingApprovals(activities)).toEqual([
       {
-        requestId: "req-request-type",
-        requestKind: "command",
+        requestId: "req-tool-call",
+        requestKind: "tool-call",
         createdAt: "2026-02-23T00:00:01.000Z",
-        detail: "pwd",
+        detail: "Fetch release notes from GitHub",
+      },
+      {
+        requestId: "req-auth",
+        requestKind: "auth",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        detail: "Refresh GitHub access token",
       },
     ]);
   });
@@ -134,6 +182,35 @@ describe("derivePendingApprovals", () => {
 
     expect(derivePendingApprovals(activities)).toEqual([]);
   });
+
+  it("clears stale pending approvals when Copilot reports unknown pending approval request", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "approval-open-copilot-stale",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "approval.requested",
+        summary: "Tool approval requested",
+        tone: "approval",
+        payload: {
+          requestId: "req-copilot-stale",
+          requestType: "dynamic_tool_call",
+        },
+      }),
+      makeActivity({
+        id: "approval-failed-copilot-stale",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "provider.approval.respond.failed",
+        summary: "Provider approval response failed",
+        tone: "error",
+        payload: {
+          requestId: "req-copilot-stale",
+          detail: "Unknown pending Copilot approval request 'req-copilot-stale'.",
+        },
+      }),
+    ];
+
+    expect(derivePendingApprovals(activities)).toEqual([]);
+  });
 });
 
 describe("derivePendingUserInputs", () => {
@@ -152,6 +229,7 @@ describe("derivePendingUserInputs", () => {
               id: "sandbox_mode",
               header: "Sandbox",
               question: "Which mode should be used?",
+              allowFreeform: false,
               options: [
                 {
                   label: "workspace-write",
@@ -209,6 +287,7 @@ describe("derivePendingUserInputs", () => {
             id: "sandbox_mode",
             header: "Sandbox",
             question: "Which mode should be used?",
+            allowFreeform: false,
             options: [
               {
                 label: "workspace-write",
@@ -236,6 +315,7 @@ describe("derivePendingUserInputs", () => {
               id: "response",
               header: "Agent input required",
               question: "Why should we take this path?",
+              allowFreeform: true,
               options: [],
             },
           ],
@@ -252,11 +332,49 @@ describe("derivePendingUserInputs", () => {
             id: "response",
             header: "Agent input required",
             question: "Why should we take this path?",
+            allowFreeform: true,
             options: [],
           },
         ],
       },
     ]);
+  });
+
+  it("clears stale pending user inputs when Copilot reports an unknown pending request", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "user-input-open-stale",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        tone: "info",
+        payload: {
+          requestId: "req-user-input-stale",
+          questions: [
+            {
+              id: "response",
+              header: "Agent input required",
+              question: "Continue with the new session?",
+              allowFreeform: true,
+              options: [],
+            },
+          ],
+        },
+      }),
+      makeActivity({
+        id: "user-input-failed-stale",
+        createdAt: "2026-02-23T00:00:04.000Z",
+        kind: "provider.user-input.respond.failed",
+        summary: "Provider user input response failed",
+        tone: "error",
+        payload: {
+          requestId: "req-user-input-stale",
+          detail: "Unknown pending Copilot user input request 'req-user-input-stale'.",
+        },
+      }),
+    ];
+
+    expect(derivePendingUserInputs(activities)).toEqual([]);
   });
 });
 
@@ -491,6 +609,27 @@ describe("deriveWorkLogEntries", () => {
     expect(entry?.command).toBe("bun run lint");
   });
 
+  it("extracts command text from preserved tool arguments", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "command-tool-arguments",
+        kind: "tool.completed",
+        summary: "Command run complete",
+        payload: {
+          itemType: "command_execution",
+          data: {
+            arguments: {
+              command: ["bun", "run", "test"],
+            },
+          },
+        },
+      }),
+    ];
+
+    const [entry] = deriveWorkLogEntries(activities, undefined);
+    expect(entry?.command).toBe("bun run test");
+  });
+
   it("extracts changed file paths for file-change tool activities", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
@@ -515,6 +654,29 @@ describe("deriveWorkLogEntries", () => {
     expect(entry?.changedFiles).toEqual([
       "apps/web/src/components/ChatView.tsx",
       "apps/web/src/session-logic.ts",
+    ]);
+  });
+
+  it("extracts changed file paths from preserved tool arguments", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "file-tool-arguments",
+        kind: "tool.completed",
+        summary: "File change complete",
+        payload: {
+          itemType: "file_change",
+          data: {
+            arguments: {
+              files: [{ path: "apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts" }],
+            },
+          },
+        },
+      }),
+    ];
+
+    const [entry] = deriveWorkLogEntries(activities, undefined);
+    expect(entry?.changedFiles).toEqual([
+      "apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts",
     ]);
   });
 });
@@ -556,6 +718,107 @@ describe("deriveTimelineEntries", () => {
       proposedPlan: {
         planMarkdown: "# Ship it",
       },
+    });
+  });
+});
+
+describe("resolveAssistantDeliveryModeForProvider", () => {
+  it("defaults Copilot turns to streaming even when the global toggle is off", () => {
+    expect(resolveAssistantDeliveryModeForProvider("copilot", false)).toBe("streaming");
+  });
+
+  it("keeps non-Copilot providers buffered unless streaming is enabled", () => {
+    expect(resolveAssistantDeliveryModeForProvider("codex", false)).toBe("buffered");
+    expect(resolveAssistantDeliveryModeForProvider("codex", true)).toBe("streaming");
+  });
+});
+
+describe("findWorkGroupIdBeforeEntry", () => {
+  it("returns the first contiguous work entry before the target entry", () => {
+    const timelineEntries = deriveTimelineEntries(
+      [
+        {
+          id: MessageId.makeUnsafe("assistant-1"),
+          role: "assistant",
+          text: "Done",
+          createdAt: "2026-02-23T00:00:04.000Z",
+          streaming: false,
+        },
+      ],
+      [],
+      [
+        {
+          id: "work-1",
+          createdAt: "2026-02-23T00:00:02.000Z",
+          label: "Ran search",
+          tone: "tool",
+        },
+        {
+          id: "work-2",
+          createdAt: "2026-02-23T00:00:03.000Z",
+          label: "Read file",
+          tone: "tool",
+        },
+      ],
+    );
+
+    expect(findWorkGroupIdBeforeEntry(timelineEntries, "assistant-1")).toBe("work-1");
+  });
+
+  it("returns null when no contiguous work group precedes the target entry", () => {
+    const timelineEntries = deriveTimelineEntries(
+      [
+        {
+          id: MessageId.makeUnsafe("assistant-2"),
+          role: "assistant",
+          text: "Done",
+          createdAt: "2026-02-23T00:00:04.000Z",
+          streaming: false,
+        },
+      ],
+      [
+        {
+          id: "plan:thread-1:turn:turn-1",
+          turnId: TurnId.makeUnsafe("turn-1"),
+          planMarkdown: "# Plan",
+          createdAt: "2026-02-23T00:00:03.000Z",
+          updatedAt: "2026-02-23T00:00:03.000Z",
+        },
+      ],
+      [
+        {
+          id: "work-1",
+          createdAt: "2026-02-23T00:00:02.000Z",
+          label: "Ran search",
+          tone: "tool",
+        },
+      ],
+    );
+
+    expect(findWorkGroupIdBeforeEntry(timelineEntries, "assistant-2")).toBeNull();
+  });
+});
+
+describe("applyDefaultExpandedWorkGroup", () => {
+  it("defaults the latest completed work group to expanded", () => {
+    expect(applyDefaultExpandedWorkGroup({}, "work-1")).toEqual({ "work-1": true });
+  });
+
+  it("preserves explicit overrides for the latest completed work group", () => {
+    expect(applyDefaultExpandedWorkGroup({ "work-1": false }, "work-1")).toEqual({
+      "work-1": false,
+    });
+  });
+});
+
+describe("toggleWorkGroupExpansion", () => {
+  it("collapses a default-expanded latest completed work group", () => {
+    expect(toggleWorkGroupExpansion({}, "work-1", "work-1")).toEqual({ "work-1": false });
+  });
+
+  it("toggles explicitly tracked work groups normally", () => {
+    expect(toggleWorkGroupExpansion({ "work-1": false }, "work-1", null)).toEqual({
+      "work-1": true,
     });
   });
 });

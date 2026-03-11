@@ -464,25 +464,34 @@ const makeGitCore = Effect.gen(function* () {
   const computeAheadCountAgainstBase = (
     cwd: string,
     branch: string,
-  ): Effect.Effect<number, GitCommandError> =>
+  ): Effect.Effect<{ aheadCount: number; comparableBaseBranch: string | null }, GitCommandError> =>
     Effect.gen(function* () {
-      const baseBranch = yield* resolveBaseBranchForNoUpstream(cwd, branch);
-      if (!baseBranch) {
-        return 0;
+      const comparableBaseBranch = yield* resolveBaseBranchForNoUpstream(cwd, branch);
+      if (!comparableBaseBranch) {
+        return {
+          aheadCount: 0,
+          comparableBaseBranch: null,
+        };
       }
 
       const result = yield* executeGit(
         "GitCore.computeAheadCountAgainstBase",
         cwd,
-        ["rev-list", "--count", `${baseBranch}..HEAD`],
+        ["rev-list", "--count", `${comparableBaseBranch}..HEAD`],
         { allowNonZeroExit: true },
       );
       if (result.code !== 0) {
-        return 0;
+        return {
+          aheadCount: 0,
+          comparableBaseBranch,
+        };
       }
 
       const parsed = Number.parseInt(result.stdout.trim(), 10);
-      return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+      return {
+        aheadCount: Number.isFinite(parsed) ? Math.max(0, parsed) : 0,
+        comparableBaseBranch,
+      };
     });
 
   const readBranchRecency = (cwd: string): Effect.Effect<Map<string, number>, GitCommandError> =>
@@ -545,6 +554,7 @@ const makeGitCore = Effect.gen(function* () {
 
       let branch: string | null = null;
       let upstreamRef: string | null = null;
+      let comparableBaseBranch: string | null = null;
       let aheadCount = 0;
       let behindCount = 0;
       let hasWorkingTreeChanges = false;
@@ -576,9 +586,16 @@ const makeGitCore = Effect.gen(function* () {
       }
 
       if (!upstreamRef && branch) {
-        aheadCount = yield* computeAheadCountAgainstBase(cwd, branch).pipe(
-          Effect.catch(() => Effect.succeed(0)),
+        const computedAheadCount = yield* computeAheadCountAgainstBase(cwd, branch).pipe(
+          Effect.catch(() =>
+            Effect.succeed({
+              aheadCount: 0,
+              comparableBaseBranch: null,
+            }),
+          ),
         );
+        aheadCount = computedAheadCount.aheadCount;
+        comparableBaseBranch = computedAheadCount.comparableBaseBranch;
         behindCount = 0;
       }
 
@@ -611,6 +628,7 @@ const makeGitCore = Effect.gen(function* () {
       return {
         branch,
         upstreamRef,
+        comparableBaseBranch,
         hasWorkingTreeChanges,
         workingTree: {
           files,
@@ -701,10 +719,7 @@ const makeGitCore = Effect.gen(function* () {
           };
         }
 
-        const comparableBaseBranch = yield* resolveBaseBranchForNoUpstream(cwd, branch).pipe(
-          Effect.catch(() => Effect.succeed(null)),
-        );
-        if (comparableBaseBranch) {
+        if (details.comparableBaseBranch) {
           const hasOriginRemote = yield* originRemoteExists(cwd).pipe(
             Effect.catch(() => Effect.succeed(false)),
           );

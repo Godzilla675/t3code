@@ -8,6 +8,8 @@
  *
  * @module ProviderHealthLive
  */
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import {
   CODEX_REASONING_EFFORT_OPTIONS,
   type CodexReasoningEffort,
@@ -20,16 +22,21 @@ import { Array, Effect, Fiber, Layer, Option, Result, Schema, Stream } from "eff
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { loadCopilotSdk } from "../copilotSdkCompat.ts";
+import { getCodexCliLaunchSpec } from "../codexCliCommand";
 import {
   formatCodexCliUpgradeMessage,
   isCodexCliVersionSupported,
   parseCodexCliVersion,
 } from "../codexCliVersion";
+import { ServerConfig } from "../../config";
 import { ProviderHealth, type ProviderHealthShape } from "../Services/ProviderHealth";
 
 const DEFAULT_TIMEOUT_MS = 4_000;
+const CODEX_PROBE_TIMEOUT_MS = process.platform === "win32" ? 30_000 : DEFAULT_TIMEOUT_MS;
 const CODEX_PROVIDER = "codex" as const;
 const COPILOT_PROVIDER = "copilot" as const;
+const COPILOT_MODELS_TIMEOUT_MS = 12_000;
+const COPILOT_AVAILABLE_MODELS_CACHE_FILENAME = "copilot-available-models.json";
 
 // ── Pure helpers ────────────────────────────────────────────────────
 
@@ -339,6 +346,57 @@ function normalizeCopilotAvailableModels(value: unknown): ReadonlyArray<ModelOpt
   return models.length > 0 ? models : undefined;
 }
 
+function normalizeCachedAvailableModels(value: unknown): ReadonlyArray<ModelOption> | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const models: ModelOption[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const record = entry as Record<string, unknown>;
+    const slug = nonEmptyTrimmed(typeof record.slug === "string" ? record.slug : undefined);
+    const name =
+      nonEmptyTrimmed(typeof record.name === "string" ? record.name : undefined) ?? slug;
+    const supportsVision =
+      typeof record.supportsVision === "boolean" ? record.supportsVision : undefined;
+    const supportedReasoningEfforts = Array.isArray(record.supportedReasoningEfforts)
+      ? record.supportedReasoningEfforts.filter(
+          (candidate): candidate is CodexReasoningEffort =>
+            typeof candidate === "string" &&
+            REASONING_EFFORT_VALUES.has(candidate as CodexReasoningEffort),
+        )
+      : [];
+    const defaultReasoningEffort =
+      typeof record.defaultReasoningEffort === "string" &&
+      REASONING_EFFORT_VALUES.has(record.defaultReasoningEffort as CodexReasoningEffort)
+        ? (record.defaultReasoningEffort as CodexReasoningEffort)
+        : undefined;
+    if (!slug || !name || seen.has(slug)) {
+      continue;
+    }
+
+    seen.add(slug);
+    models.push({
+      slug,
+      name,
+      ...(supportsVision !== undefined ? { supportsVision } : {}),
+      ...(supportedReasoningEfforts.length > 0 ? { supportedReasoningEfforts } : {}),
+      ...(defaultReasoningEffort &&
+      (supportedReasoningEfforts.length === 0 ||
+        supportedReasoningEfforts.includes(defaultReasoningEffort))
+        ? { defaultReasoningEffort }
+        : {}),
+    });
+  }
+
+  return models.length > 0 ? models : undefined;
+}
+
 const makeCopilotHealthClient = async (): Promise<CopilotHealthClient> => {
   const sdk = await loadCopilotSdk();
   return new sdk.CopilotClient({ autoStart: false });
@@ -384,6 +442,11 @@ const stopCopilotHealthClient = (client: CopilotHealthClient): Effect.Effect<voi
 const probeCopilotHealthClient = (
   client: CopilotHealthClient,
   checkedAt: string,
+  options?: {
+    readonly modelsTimeoutMs?: number;
+    readonly readCachedModels?: () => Promise<ReadonlyArray<ModelOption> | undefined>;
+    readonly writeCachedModels?: (models: ReadonlyArray<ModelOption>) => Promise<void>;
+  },
 ): Effect.Effect<ServerProviderStatus> =>
   Effect.gen(function* () {
     const startProbe = yield* Effect.tryPromise({
@@ -459,7 +522,14 @@ const probeCopilotHealthClient = (
     }
 
     const parsed = parseCopilotAuthStatus(authProbe.success.value);
-    const availableModels =
+    const cachedAvailableModels =
+      options?.readCachedModels !== undefined
+        ? yield* Effect.tryPromise({
+            try: () => options.readCachedModels!(),
+            catch: () => undefined,
+          }).pipe(Effect.orElseSucceed(() => undefined))
+        : undefined;
+    const liveAvailableModels =
       parsed.authStatus === "authenticated" && typeof client.listModels === "function"
         ? yield* Effect.tryPromise({
             try: () => client.listModels!(),
@@ -470,7 +540,7 @@ const probeCopilotHealthClient = (
                 cause,
               ),
           }).pipe(
-            Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
+            Effect.timeoutOption(options?.modelsTimeoutMs ?? DEFAULT_TIMEOUT_MS),
             Effect.result,
             Effect.map((modelsProbe) =>
               Result.isSuccess(modelsProbe) && Option.isSome(modelsProbe.success)
@@ -479,6 +549,13 @@ const probeCopilotHealthClient = (
             ),
           )
         : undefined;
+    const availableModels = liveAvailableModels ?? cachedAvailableModels;
+    if (liveAvailableModels && options?.writeCachedModels) {
+      yield* Effect.tryPromise({
+        try: () => options.writeCachedModels!(liveAvailableModels),
+        catch: () => undefined,
+      }).pipe(Effect.orElseSucceed(() => undefined));
+    }
     return {
       provider: COPILOT_PROVIDER,
       status: parsed.status,
@@ -502,8 +579,10 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
 const runCodexCommand = (args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const command = ChildProcess.make("codex", [...args], {
-      shell: process.platform === "win32",
+    const launch = getCodexCliLaunchSpec({ args });
+    const command = ChildProcess.make(launch.command, [...launch.args], {
+      ...(launch.extraEnv ? { env: { ...process.env, ...launch.extraEnv } } : {}),
+      shell: launch.shell,
     });
 
     const child = yield* spawner.spawn(command);
@@ -531,7 +610,7 @@ export const checkCodexProviderStatus: Effect.Effect<
 
   // Probe 1: `codex --version` — is the CLI reachable?
   const versionProbe = yield* runCodexCommand(["--version"]).pipe(
-    Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
+    Effect.timeoutOption(CODEX_PROBE_TIMEOUT_MS),
     Effect.result,
   );
 
@@ -589,7 +668,7 @@ export const checkCodexProviderStatus: Effect.Effect<
 
   // Probe 2: `codex login status` — is the user authenticated?
   const authProbe = yield* runCodexCommand(["login", "status"]).pipe(
-    Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
+    Effect.timeoutOption(CODEX_PROBE_TIMEOUT_MS),
     Effect.result,
   );
 
@@ -632,6 +711,9 @@ export const checkCodexProviderStatus: Effect.Effect<
 
 export const checkCopilotProviderStatus = (options?: {
   readonly clientFactory?: () => CopilotHealthClient | Promise<CopilotHealthClient>;
+  readonly modelsTimeoutMs?: number;
+  readonly readCachedModels?: () => Promise<ReadonlyArray<ModelOption> | undefined>;
+  readonly writeCachedModels?: (models: ReadonlyArray<ModelOption>) => Promise<void>;
 }): Effect.Effect<ServerProviderStatus> =>
   Effect.tryPromise({
     try: () => Promise.resolve((options?.clientFactory ?? makeCopilotHealthClient)()),
@@ -641,14 +723,14 @@ export const checkCopilotProviderStatus = (options?: {
         `Failed to initialize GitHub Copilot health check: ${toError(cause).message}.`,
         cause,
       ),
-  }).pipe(
-    Effect.flatMap((client) =>
-      Effect.acquireUseRelease(
-        Effect.succeed(client),
-        (readyClient) => probeCopilotHealthClient(readyClient, new Date().toISOString()),
-        stopCopilotHealthClient,
+    }).pipe(
+      Effect.flatMap((client) =>
+        Effect.acquireUseRelease(
+          Effect.succeed(client),
+          (readyClient) => probeCopilotHealthClient(readyClient, new Date().toISOString(), options),
+          stopCopilotHealthClient,
+        ),
       ),
-    ),
     Effect.catchTag("CopilotHealthProbeError", (error) =>
       Effect.succeed({
         provider: COPILOT_PROVIDER,
@@ -666,12 +748,36 @@ export const checkCopilotProviderStatus = (options?: {
 export const ProviderHealthLive = Layer.effect(
   ProviderHealth,
   Effect.gen(function* () {
+    const serverConfig = yield* ServerConfig;
+    const copilotAvailableModelsCachePath = path.join(
+      serverConfig.stateDir,
+      COPILOT_AVAILABLE_MODELS_CACHE_FILENAME,
+    );
+
     const codexStatusFiber = yield* checkCodexProviderStatus.pipe(
       Effect.map(Array.of),
       Effect.forkScoped,
     );
 
-    const copilotStatusFiber = yield* checkCopilotProviderStatus().pipe(
+    const copilotStatusFiber = yield* checkCopilotProviderStatus({
+      modelsTimeoutMs: COPILOT_MODELS_TIMEOUT_MS,
+      readCachedModels: async () => {
+        try {
+          const raw = await fs.readFile(copilotAvailableModelsCachePath, "utf8");
+          return normalizeCachedAvailableModels(JSON.parse(raw));
+        } catch {
+          return undefined;
+        }
+      },
+      writeCachedModels: async (models) => {
+        await fs.mkdir(path.dirname(copilotAvailableModelsCachePath), { recursive: true });
+        await fs.writeFile(
+          copilotAvailableModelsCachePath,
+          JSON.stringify(models, null, 2),
+          "utf8",
+        );
+      },
+    }).pipe(
       Effect.map(Array.of),
       Effect.forkScoped,
     );

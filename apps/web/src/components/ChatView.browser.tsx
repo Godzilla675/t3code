@@ -923,6 +923,100 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
+  it("shows Copilot reasoning controls in the compact composer menu when runtime metadata supports it", async () => {
+    const snapshot = createSnapshotForTargetUser({
+      targetMessageId: "msg-user-copilot-reasoning" as MessageId,
+      targetText: "copilot reasoning target",
+    });
+
+    const mounted = await mountChatView({
+      viewport: {
+        name: "compact-copilot",
+        width: 320,
+        height: 700,
+        textTolerancePx: 84,
+        attachmentTolerancePx: 56,
+      },
+      snapshot,
+      configureFixture: (nextFixture) => {
+        nextFixture.serverConfig = {
+          ...nextFixture.serverConfig,
+          providers: [
+            {
+              provider: "codex",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              checkedAt: NOW_ISO,
+            },
+            {
+              provider: "copilot",
+              status: "ready",
+              available: true,
+              authStatus: "authenticated",
+              checkedAt: NOW_ISO,
+              availableModels: [
+                {
+                  slug: "claude-sonnet-4.6",
+                  name: "Claude Sonnet 4.6",
+                  supportedReasoningEfforts: ["medium", "low"],
+                  defaultReasoningEffort: "medium",
+                },
+              ],
+            },
+          ],
+        };
+        nextFixture.snapshot = {
+          ...nextFixture.snapshot,
+          projects: nextFixture.snapshot.projects.map((project) =>
+            project.id === PROJECT_ID
+              ? {
+                  ...project,
+                  defaultModel: "claude-sonnet-4.6",
+                }
+              : project,
+          ),
+          threads: nextFixture.snapshot.threads.map((thread) =>
+            thread.id === THREAD_ID
+              ? {
+                  ...thread,
+                  model: "claude-sonnet-4.6",
+                  session: thread.session
+                    ? {
+                        ...thread.session,
+                        providerName: "copilot",
+                      }
+                    : null,
+                }
+              : thread,
+          ),
+        };
+      },
+    });
+
+    try {
+      const controlsButton = await waitForElement(
+        () =>
+          Array.from(document.querySelectorAll("button")).find(
+            (button) => button.getAttribute("aria-label") === "More composer controls",
+          ) as HTMLButtonElement | null,
+        "Unable to find compact composer controls button.",
+      );
+      controlsButton.click();
+
+      await vi.waitFor(
+        () => {
+          expect(document.body.textContent).toContain("Reasoning");
+          expect(document.body.textContent).toContain("Medium (default)");
+          expect(document.body.textContent).toContain("Low");
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
   it("keeps long proposed plans lightweight until the user expands them", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,

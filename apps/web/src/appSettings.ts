@@ -6,6 +6,7 @@ import {
   type ProviderKind,
   type ProviderServiceTier,
   type ProviderStartOptions,
+  type ServerProviderStatus,
 } from "@t3tools/contracts";
 import { getDefaultModel, getModelOptions, normalizeModelSlug } from "@t3tools/shared/model";
 
@@ -78,6 +79,12 @@ export interface AppModelOption {
 }
 
 type RuntimeModelOption = Omit<ModelOption, never>;
+export type RuntimeModelOptionsByProvider = Record<ProviderKind, ReadonlyArray<RuntimeModelOption>>;
+
+export const EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER: RuntimeModelOptionsByProvider = {
+  codex: [],
+  copilot: [],
+};
 
 function normalizeOptionalProviderSetting(value: string): string | undefined {
   const trimmed = value.trim();
@@ -275,6 +282,52 @@ export function getAppModelOptions(
   }
 
   return options;
+}
+
+function mergeRuntimeModelOptions(
+  currentModels: readonly RuntimeModelOption[],
+  cachedModels: readonly RuntimeModelOption[],
+): ReadonlyArray<RuntimeModelOption> {
+  if (currentModels.length === 0) {
+    return cachedModels;
+  }
+
+  const cachedBySlug = new Map(cachedModels.map((option) => [option.slug, option]));
+  return currentModels.map((option) => {
+    const cached = cachedBySlug.get(option.slug);
+    if (!cached) {
+      return option;
+    }
+
+    return {
+      ...option,
+      ...(option.supportsVision === undefined && cached.supportsVision !== undefined
+        ? { supportsVision: cached.supportsVision }
+        : {}),
+      ...(option.supportedReasoningEfforts === undefined &&
+      cached.supportedReasoningEfforts !== undefined
+        ? { supportedReasoningEfforts: cached.supportedReasoningEfforts }
+        : {}),
+      ...(option.defaultReasoningEffort === undefined && cached.defaultReasoningEffort !== undefined
+        ? { defaultReasoningEffort: cached.defaultReasoningEffort }
+        : {}),
+    };
+  });
+}
+
+export function getRuntimeModelOptionsByProvider(
+  providerStatuses: ReadonlyArray<Pick<ServerProviderStatus, "provider" | "availableModels">>,
+  cachedRuntimeModelOptions: RuntimeModelOptionsByProvider = EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER,
+): RuntimeModelOptionsByProvider {
+  const codexRuntimeModels =
+    providerStatuses.find((status) => status.provider === "codex")?.availableModels ?? [];
+  const copilotRuntimeModels =
+    providerStatuses.find((status) => status.provider === "copilot")?.availableModels ?? [];
+
+  return {
+    codex: mergeRuntimeModelOptions(codexRuntimeModels, cachedRuntimeModelOptions.codex),
+    copilot: mergeRuntimeModelOptions(copilotRuntimeModels, cachedRuntimeModelOptions.copilot),
+  };
 }
 
 export function resolveAppModelSelection(

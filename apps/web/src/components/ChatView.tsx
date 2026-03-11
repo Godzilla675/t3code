@@ -64,17 +64,21 @@ import {
   replaceTextRange,
 } from "../composer-logic";
 import {
+  applyDefaultExpandedWorkGroup,
   derivePendingApprovals,
   derivePendingUserInputs,
   derivePhase,
   deriveTimelineEntries,
   deriveActiveWorkStartedAt,
   deriveActivePlanState,
+  findWorkGroupIdBeforeEntry,
   findLatestProposedPlan,
   type PendingApproval,
   type PendingUserInput,
   type ProviderPickerKind,
   PROVIDER_OPTIONS,
+  resolveAssistantDeliveryModeForProvider,
+  toggleWorkGroupExpansion,
   deriveWorkLogEntries,
   hasToolActivityForTurn,
   isLatestTurnSettled,
@@ -83,6 +87,7 @@ import {
 } from "../session-logic";
 import { AUTO_SCROLL_BOTTOM_THRESHOLD_PX, isScrollContainerNearBottom } from "../chat-scroll";
 import {
+  allowsPendingUserInputCustomAnswer,
   buildPendingUserInputAnswers,
   derivePendingUserInputProgress,
   setPendingUserInputCustomAnswer,
@@ -206,11 +211,13 @@ import { SidebarTrigger } from "./ui/sidebar";
 import { newCommandId, newMessageId, newThreadId } from "~/lib/utils";
 import { readNativeApi } from "~/nativeApi";
 import {
+  EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER,
   type AppModelOption,
   type AppSettings,
-  getCustomModelsForProvider,
   getAppModelOptions,
+  getCustomModelsForProvider,
   getProviderStartOptions,
+  getRuntimeModelOptionsByProvider,
   inferProviderForAppModel,
   resolveAppModelSelection,
   useAppSettings,
@@ -228,6 +235,93 @@ import { selectThreadTerminalState, useTerminalStateStore } from "../terminalSta
 import { clamp } from "effect/Number";
 import { ComposerPromptEditor, type ComposerPromptEditorHandle } from "./ComposerPromptEditor";
 import { estimateTimelineMessageHeight } from "./timelineHeight";
+
+const RUNTIME_MODEL_OPTIONS_CACHE_STORAGE_KEY = "t3code:runtime-model-options:v1";
+
+function normalizeCachedRuntimeModelOption(value: unknown): AppModelOption | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const slug = typeof record.slug === "string" ? record.slug : null;
+  const name = typeof record.name === "string" ? record.name : null;
+  if (!slug || !name) {
+    return null;
+  }
+
+  const option: AppModelOption = {
+    slug,
+    name,
+    isCustom: false,
+  };
+
+  if (typeof record.supportsVision === "boolean") {
+    option.supportsVision = record.supportsVision;
+  }
+
+  if (Array.isArray(record.supportedReasoningEfforts)) {
+    const supportedReasoningEfforts = record.supportedReasoningEfforts.filter(
+      (effort): effort is CodexReasoningEffort =>
+        effort === "xhigh" || effort === "high" || effort === "medium" || effort === "low",
+    );
+    if (supportedReasoningEfforts.length > 0) {
+      option.supportedReasoningEfforts = supportedReasoningEfforts;
+    }
+  }
+
+  if (
+    record.defaultReasoningEffort === "xhigh" ||
+    record.defaultReasoningEffort === "high" ||
+    record.defaultReasoningEffort === "medium" ||
+    record.defaultReasoningEffort === "low"
+  ) {
+    option.defaultReasoningEffort = record.defaultReasoningEffort;
+  }
+
+  return option;
+}
+
+function readCachedRuntimeModelOptionsByProvider() {
+  if (typeof window === "undefined") {
+    return EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(RUNTIME_MODEL_OPTIONS_CACHE_STORAGE_KEY);
+    if (!raw) {
+      return EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER;
+    }
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const codex = Array.isArray(parsed.codex)
+      ? parsed.codex
+          .map(normalizeCachedRuntimeModelOption)
+          .filter((option): option is AppModelOption => option !== null)
+      : [];
+    const copilot = Array.isArray(parsed.copilot)
+      ? parsed.copilot
+          .map(normalizeCachedRuntimeModelOption)
+          .filter((option): option is AppModelOption => option !== null)
+      : [];
+    return { codex, copilot };
+  } catch {
+    return EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER;
+  }
+}
+
+function writeCachedRuntimeModelOptionsByProvider(
+  value: ReturnType<typeof getRuntimeModelOptionsByProvider>,
+): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(RUNTIME_MODEL_OPTIONS_CACHE_STORAGE_KEY, JSON.stringify(value));
+  } catch {
+    // Ignore storage write failures; live runtime metadata still works for this session.
+  }
+}
 
 function formatMessageMeta(createdAt: string, duration: string | null): string {
   if (!duration) return formatTimestamp(createdAt);
@@ -788,7 +882,36 @@ export default function ChatView({ threadId }: ChatViewProps) {
   );
   const serverConfigQuery = useQuery(serverConfigQueryOptions());
   const providerStatuses = serverConfigQuery.data?.providers ?? EMPTY_PROVIDER_STATUSES;
-  const runtimeModelOptionsByProvider = getRuntimeModelOptionsByProvider(providerStatuses);
+  const [cachedRuntimeModelOptionsByProvider, setCachedRuntimeModelOptionsByProvider] = useState(
+    readCachedRuntimeModelOptionsByProvider,
+  );
+  const runtimeModelOptionsByProvider = useMemo(
+    () => getRuntimeModelOptionsByProvider(providerStatuses, cachedRuntimeModelOptionsByProvider),
+    [cachedRuntimeModelOptionsByProvider, providerStatuses],
+  );
+  const serializedRuntimeModelOptionsByProvider = useMemo(
+    () => JSON.stringify(runtimeModelOptionsByProvider),
+    [runtimeModelOptionsByProvider],
+  );
+  const serializedCachedRuntimeModelOptionsByProvider = useMemo(
+    () => JSON.stringify(cachedRuntimeModelOptionsByProvider),
+    [cachedRuntimeModelOptionsByProvider],
+  );
+  useEffect(() => {
+    if (
+      serializedRuntimeModelOptionsByProvider === serializedCachedRuntimeModelOptionsByProvider
+    ) {
+      return;
+    }
+
+    setCachedRuntimeModelOptionsByProvider(runtimeModelOptionsByProvider);
+    writeCachedRuntimeModelOptionsByProvider(runtimeModelOptionsByProvider);
+  }, [
+    cachedRuntimeModelOptionsByProvider,
+    runtimeModelOptionsByProvider,
+    serializedCachedRuntimeModelOptionsByProvider,
+    serializedRuntimeModelOptionsByProvider,
+  ]);
   const inferredProviderFromModel = useMemo(
     () => {
       const activeModel = activeThread?.model ?? activeProject?.model ?? null;
@@ -885,6 +1008,11 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const selectedProviderStartOptions = useMemo(
     () => getProviderStartOptions(settings, selectedProvider),
     [selectedProvider, settings],
+  );
+  const assistantDeliveryMode = useMemo(
+    () =>
+      resolveAssistantDeliveryModeForProvider(selectedProvider, settings.enableAssistantStreaming),
+    [selectedProvider, settings.enableAssistantStreaming],
   );
   const selectedModelForPicker = selectedModel;
   const selectedModelForPickerWithCustomFallback = useMemo(() => {
@@ -1222,6 +1350,21 @@ export default function ChatView({ threadId }: ChatViewProps) {
     latestTurnSettled,
     timelineEntries,
   ]);
+  const latestCompletedWorkGroupId = useMemo(() => {
+    if (!latestTurnSettled || !latestTurnHasToolActivity) {
+      return null;
+    }
+    return findWorkGroupIdBeforeEntry(timelineEntries, completionDividerBeforeEntryId);
+  }, [
+    completionDividerBeforeEntryId,
+    latestTurnHasToolActivity,
+    latestTurnSettled,
+    timelineEntries,
+  ]);
+  const effectiveExpandedWorkGroups = useMemo(
+    () => applyDefaultExpandedWorkGroup(expandedWorkGroups, latestCompletedWorkGroupId),
+    [expandedWorkGroups, latestCompletedWorkGroupId],
+  );
   const gitCwd = activeThread?.worktreePath ?? activeProject?.cwd ?? null;
   const composerTriggerKind = composerTrigger?.kind ?? null;
   const pathTriggerQuery = composerTrigger?.kind === "path" ? composerTrigger.query : "";
@@ -2008,7 +2151,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   }, [phase, scheduleStickToBottom, timelineEntries]);
 
   useEffect(() => {
-    setExpandedWorkGroups({});
+    setExpandedWorkGroups((existing) => (Object.keys(existing).length === 0 ? existing : {}));
     if (planSidebarOpenOnNextThreadRef.current) {
       planSidebarOpenOnNextThreadRef.current = false;
       setPlanSidebarOpen(true);
@@ -2083,6 +2226,9 @@ export default function ChatView({ threadId }: ChatViewProps) {
 
   useEffect(() => {
     setOptimisticUserMessages((existing) => {
+      if (existing.length === 0) {
+        return existing;
+      }
       for (const message of existing) {
         revokeUserMessagePreviewUrls(message);
       }
@@ -2751,7 +2897,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           : {}),
         provider: selectedProvider,
         providerOptions: selectedProviderStartOptions,
-        assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
+        assistantDeliveryMode,
         runtimeMode,
         interactionMode,
         createdAt: messageCreatedAt,
@@ -2904,7 +3050,13 @@ export default function ChatView({ threadId }: ChatViewProps) {
 
   const onChangeActivePendingUserInputCustomAnswer = useCallback(
     (questionId: string, value: string, nextCursor: number, cursorAdjacentToMention: boolean) => {
-      if (!activePendingUserInput) {
+      const activeQuestion = activePendingProgress?.activeQuestion;
+      if (
+        !activePendingUserInput ||
+        !activeQuestion ||
+        activeQuestion.id !== questionId ||
+        !allowsPendingUserInputCustomAnswer(activeQuestion)
+      ) {
         return;
       }
       promptRef.current = value;
@@ -2913,6 +3065,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
         [activePendingUserInput.requestId]: {
           ...existing[activePendingUserInput.requestId],
           [questionId]: setPendingUserInputCustomAnswer(
+            activeQuestion,
             existing[activePendingUserInput.requestId]?.[questionId],
             value,
           ),
@@ -2923,9 +3076,9 @@ export default function ChatView({ threadId }: ChatViewProps) {
         cursorAdjacentToMention
           ? null
           : detectComposerTrigger(value, expandCollapsedComposerCursor(value, nextCursor)),
-      );
+        );
     },
-    [activePendingUserInput],
+    [activePendingProgress?.activeQuestion, activePendingUserInput],
   );
 
   const onAdvanceActivePendingUserInput = useCallback(() => {
@@ -3028,7 +3181,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           ...(selectedModelOptionsForDispatch
             ? { modelOptions: selectedModelOptionsForDispatch }
             : {}),
-          assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
+          assistantDeliveryMode,
           runtimeMode,
           interactionMode: nextInteractionMode,
           createdAt: messageCreatedAt,
@@ -3063,13 +3216,13 @@ export default function ChatView({ threadId }: ChatViewProps) {
       persistThreadSettingsForNextTurn,
       resetSendPhase,
       runtimeMode,
+      assistantDeliveryMode,
       selectedModel,
       selectedModelOptionsForDispatch,
       selectedProviderStartOptions,
       selectedProvider,
       setComposerDraftInteractionMode,
       setThreadError,
-      settings.enableAssistantStreaming,
     ],
   );
 
@@ -3137,7 +3290,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           ...(selectedModelOptionsForDispatch
             ? { modelOptions: selectedModelOptionsForDispatch }
             : {}),
-          assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
+          assistantDeliveryMode,
           runtimeMode,
           interactionMode: "default",
           createdAt,
@@ -3186,11 +3339,11 @@ export default function ChatView({ threadId }: ChatViewProps) {
     navigate,
     resetSendPhase,
     runtimeMode,
+    assistantDeliveryMode,
     selectedModel,
     selectedModelOptionsForDispatch,
     selectedProviderStartOptions,
     selectedProvider,
-    settings.enableAssistantStreaming,
     syncServerReadModel,
   ]);
 
@@ -3261,11 +3414,15 @@ export default function ChatView({ threadId }: ChatViewProps) {
       promptRef.current = next.text;
       const activePendingQuestion = activePendingProgress?.activeQuestion;
       if (activePendingQuestion && activePendingUserInput) {
+        if (!allowsPendingUserInputCustomAnswer(activePendingQuestion)) {
+          return false;
+        }
         setPendingUserInputAnswersByRequestId((existing) => ({
           ...existing,
           [activePendingUserInput.requestId]: {
             ...existing[activePendingUserInput.requestId],
             [activePendingQuestion.id]: setPendingUserInputCustomAnswer(
+              activePendingQuestion,
               existing[activePendingUserInput.requestId]?.[activePendingQuestion.id],
               next.text,
             ),
@@ -3456,11 +3613,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
     return false;
   };
   const onToggleWorkGroup = useCallback((groupId: string) => {
-    setExpandedWorkGroups((existing) => ({
-      ...existing,
-      [groupId]: !existing[groupId],
-    }));
-  }, []);
+    setExpandedWorkGroups((existing) =>
+      toggleWorkGroupExpansion(existing, groupId, latestCompletedWorkGroupId),
+    );
+  }, [latestCompletedWorkGroupId]);
   const onExpandTimelineImage = useCallback((preview: ExpandedImagePreview) => {
     setExpandedImage(preview);
   }, []);
@@ -3480,13 +3636,16 @@ export default function ChatView({ threadId }: ChatViewProps) {
     },
     [navigate, threadId],
   );
-  const onRevertUserMessage = (messageId: MessageId) => {
-    const targetTurnCount = revertTurnCountByUserMessageId.get(messageId);
-    if (typeof targetTurnCount !== "number") {
-      return;
-    }
-    void onRevertToTurnCount(targetTurnCount);
-  };
+  const onRevertUserMessage = useCallback(
+    (messageId: MessageId) => {
+      const targetTurnCount = revertTurnCountByUserMessageId.get(messageId);
+      if (typeof targetTurnCount !== "number") {
+        return;
+      }
+      void onRevertToTurnCount(targetTurnCount);
+    },
+    [onRevertToTurnCount, revertTurnCountByUserMessageId],
+  );
 
   // Empty state: no active thread
   if (!activeThread) {
@@ -3585,7 +3744,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
               completionSummary={completionSummary}
               turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
               nowIso={nowIso}
-              expandedWorkGroups={expandedWorkGroups}
+              expandedWorkGroups={effectiveExpandedWorkGroups}
               onToggleWorkGroup={onToggleWorkGroup}
               onOpenTurnDiff={onOpenTurnDiff}
               revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
@@ -3750,7 +3909,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
                         ? (activePendingApproval?.detail ??
                           "Resolve this approval request to continue")
                         : activePendingProgress
-                          ? "Type your own answer, or leave this blank to use the selected option"
+                          ? activePendingProgress.activeQuestion &&
+                            !allowsPendingUserInputCustomAnswer(activePendingProgress.activeQuestion)
+                            ? "Select one of the provided options to continue"
+                            : "Type your own answer, or leave this blank to use the selected option"
                           : showPlanFollowUpPrompt && activeProposedPlan
                             ? "Add feedback to refine the plan, or leave this blank to implement it"
                             : phase === "disconnected"
@@ -3804,6 +3966,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
                           interactionMode={interactionMode}
                           planSidebarOpen={planSidebarOpen}
                           runtimeMode={runtimeMode}
+                          defaultEffort={defaultReasoningEffort}
                           selectedEffort={selectedEffort}
                           selectedProvider={selectedProvider}
                           selectedCodexFastModeEnabled={selectedCodexFastModeEnabled}
@@ -4395,7 +4558,13 @@ const ComposerPendingApprovalPanel = memo(function ComposerPendingApprovalPanel(
       ? "Command approval requested"
       : approval.requestKind === "file-read"
         ? "File-read approval requested"
-        : "File-change approval requested";
+        : approval.requestKind === "file-change"
+          ? "File-change approval requested"
+          : approval.requestKind === "tool-call"
+            ? "Tool approval requested"
+            : approval.requestKind === "auth"
+              ? "Authentication approval requested"
+              : "Approval requested";
 
   return (
     <div className="px-4 py-3.5 sm:px-5 sm:py-4">
@@ -5616,17 +5785,6 @@ const COMING_SOON_PROVIDER_OPTIONS = [
   { id: "gemini", label: "Gemini", icon: Gemini },
 ] as const;
 
-function getRuntimeModelOptionsByProvider(
-  providerStatuses: ReadonlyArray<ServerProviderStatus>,
-): Record<ProviderKind, ReadonlyArray<NonNullable<ServerProviderStatus["availableModels"]>[number]>> {
-  return {
-    codex:
-      providerStatuses.find((status) => status.provider === "codex")?.availableModels ?? [],
-    copilot:
-      providerStatuses.find((status) => status.provider === "copilot")?.availableModels ?? [],
-  };
-}
-
 function getCustomModelOptionsByProvider(
   settings: Pick<AppSettings, "customCodexModels" | "customCopilotModels">,
   runtimeModelOptionsByProvider: Record<
@@ -5829,6 +5987,7 @@ const CompactComposerControlsMenu = memo(function CompactComposerControlsMenu(pr
   interactionMode: ProviderInteractionMode;
   planSidebarOpen: boolean;
   runtimeMode: RuntimeMode;
+  defaultEffort: CodexReasoningEffort | null;
   selectedEffort: CodexReasoningEffort | null;
   selectedProvider: ProviderKind;
   selectedCodexFastModeEnabled: boolean;
@@ -5839,7 +5998,6 @@ const CompactComposerControlsMenu = memo(function CompactComposerControlsMenu(pr
   onTogglePlanSidebar: () => void;
   onToggleRuntimeMode: () => void;
 }) {
-  const defaultReasoningEffort = getDefaultReasoningEffortForModel(props.selectedProvider, null);
   const reasoningLabelByOption: Record<CodexReasoningEffort, string> = {
     low: "Low",
     medium: "Medium",
@@ -5862,7 +6020,7 @@ const CompactComposerControlsMenu = memo(function CompactComposerControlsMenu(pr
         <EllipsisIcon aria-hidden="true" className="size-4" />
       </MenuTrigger>
       <MenuPopup align="start">
-        {props.selectedProvider === "codex" && props.selectedEffort != null ? (
+        {props.reasoningOptions.length > 0 && props.selectedEffort != null ? (
           <>
             <MenuGroup>
               <div className="px-2 py-1.5 font-medium text-muted-foreground text-xs">Reasoning</div>
@@ -5878,12 +6036,16 @@ const CompactComposerControlsMenu = memo(function CompactComposerControlsMenu(pr
                 {props.reasoningOptions.map((effort) => (
                   <MenuRadioItem key={effort} value={effort}>
                     {reasoningLabelByOption[effort]}
-                    {effort === defaultReasoningEffort ? " (default)" : ""}
+                    {effort === props.defaultEffort ? " (default)" : ""}
                   </MenuRadioItem>
                 ))}
               </MenuRadioGroup>
             </MenuGroup>
             <MenuDivider />
+          </>
+        ) : null}
+        {props.selectedProvider === "codex" ? (
+          <>
             <MenuGroup>
               <div className="px-2 py-1.5 font-medium text-muted-foreground text-xs">Fast Mode</div>
               <MenuRadioGroup

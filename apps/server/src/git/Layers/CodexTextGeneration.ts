@@ -7,6 +7,7 @@ import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shar
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import { getCodexCliLaunchSpec } from "../../provider/codexCliCommand";
 import { TextGenerationError } from "../Errors.ts";
 import {
   type BranchNameGenerationInput,
@@ -204,9 +205,8 @@ const makeCodexTextGeneration = Effect.gen(function* () {
       const outputPath = yield* writeTempFile(operation, "codex-output", "");
 
       const runCodexCommand = Effect.gen(function* () {
-        const command = ChildProcess.make(
-          "codex",
-          [
+        const launch = getCodexCliLaunchSpec({
+          args: [
             "exec",
             "--ephemeral",
             "-s",
@@ -222,14 +222,15 @@ const makeCodexTextGeneration = Effect.gen(function* () {
             ...imagePaths.flatMap((imagePath) => ["--image", imagePath]),
             "-",
           ],
-          {
-            cwd,
-            shell: process.platform === "win32",
-            stdin: {
-              stream: Stream.make(new TextEncoder().encode(prompt)),
-            },
+        });
+        const command = ChildProcess.make(launch.command, [...launch.args], {
+          cwd,
+          ...(launch.extraEnv ? { env: { ...process.env, ...launch.extraEnv } } : {}),
+          shell: launch.shell,
+          stdin: {
+            stream: Stream.make(new TextEncoder().encode(prompt)),
           },
-        );
+        });
 
         const child = yield* commandSpawner
           .spawn(command)

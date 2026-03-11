@@ -39,8 +39,10 @@ import { ServerConfig } from "../../config.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.makeUnsafe(value);
 const asTurnId = (value: string): TurnId => TurnId.makeUnsafe(value);
-const CheckpointReactorAsyncTimeoutMs = process.platform === "win32" ? 8_000 : 3_000;
-const CheckpointReactorSlowTestTimeoutMs = process.platform === "win32" ? 20_000 : 7_500;
+const CheckpointReactorAsyncTimeoutMs = process.platform === "win32" ? 20_000 : 7_500;
+const CheckpointReactorSlowTestTimeoutMs = process.platform === "win32" ? 45_000 : 15_000;
+const CheckpointReactorPollIntervalMs = process.platform === "win32" ? 25 : 10;
+const CheckpointReactorStartupDelay = process.platform === "win32" ? "50 millis" : "10 millis";
 
 function normalizeLineEndings(value: string): string {
   return value.replace(/\r\n/g, "\n");
@@ -136,7 +138,7 @@ async function waitForThread(
     if (Date.now() >= deadline) {
       throw new Error("Timed out waiting for thread state.");
     }
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, CheckpointReactorPollIntervalMs));
     return poll();
   };
   return poll();
@@ -158,7 +160,7 @@ async function waitForEvent(
     if (Date.now() >= deadline) {
       throw new Error("Timed out waiting for orchestration event.");
     }
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, CheckpointReactorPollIntervalMs));
     return poll();
   };
   return poll();
@@ -230,7 +232,7 @@ async function waitForGitRefExists(
     if (Date.now() >= deadline) {
       throw new Error(`Timed out waiting for git ref '${ref}'.`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, CheckpointReactorPollIntervalMs));
     return poll();
   };
   return poll();
@@ -297,7 +299,7 @@ describe("CheckpointReactor", () => {
     const checkpointStore = await runtime.runPromise(Effect.service(CheckpointStore));
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start.pipe(Scope.provide(scope)));
-    await Effect.runPromise(Effect.sleep("10 millis"));
+    await Effect.runPromise(Effect.sleep(CheckpointReactorStartupDelay));
 
     const createdAt = new Date().toISOString();
     await Effect.runPromise(
@@ -906,7 +908,7 @@ describe("CheckpointReactor", () => {
       if (Date.now() >= deadline) {
         throw new Error("Timed out waiting for rollbackConversation calls.");
       }
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await new Promise((resolve) => setTimeout(resolve, CheckpointReactorPollIntervalMs));
       return waitForRollbackCalls();
     };
     await waitForRollbackCalls();

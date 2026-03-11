@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  allowsPendingUserInputCustomAnswer,
   buildPendingUserInputAnswers,
   countAnsweredPendingUserInputQuestions,
   derivePendingUserInputProgress,
@@ -9,10 +10,36 @@ import {
   setPendingUserInputCustomAnswer,
 } from "./pendingUserInput";
 
+const freeformQuestion = {
+  id: "compat",
+  header: "Compat",
+  question: "How strict should compatibility be?",
+  options: [
+    {
+      label: "Keep current envelope",
+      description: "Preserve current wire format",
+    },
+  ],
+  allowFreeform: true,
+} as const;
+
+const choiceOnlyQuestion = {
+  id: "scope",
+  header: "Scope",
+  question: "What should the plan target first?",
+  options: [
+    {
+      label: "Orchestration-first",
+      description: "Focus on orchestration first",
+    },
+  ],
+  allowFreeform: false,
+} as const;
+
 describe("resolvePendingUserInputAnswer", () => {
   it("prefers a custom answer over a selected option", () => {
     expect(
-      resolvePendingUserInputAnswer({
+      resolvePendingUserInputAnswer(freeformQuestion, {
         selectedOptionLabel: "Keep current envelope",
         customAnswer: "Keep the existing envelope for one release",
       }),
@@ -21,7 +48,7 @@ describe("resolvePendingUserInputAnswer", () => {
 
   it("falls back to the selected option", () => {
     expect(
-      resolvePendingUserInputAnswer({
+      resolvePendingUserInputAnswer(freeformQuestion, {
         selectedOptionLabel: "Scaffold only",
       }),
     ).toBe("Scaffold only");
@@ -30,6 +57,7 @@ describe("resolvePendingUserInputAnswer", () => {
   it("clears the preset selection when a custom answer is entered", () => {
     expect(
       setPendingUserInputCustomAnswer(
+        freeformQuestion,
         {
           selectedOptionLabel: "Preserve existing tags",
         },
@@ -40,6 +68,31 @@ describe("resolvePendingUserInputAnswer", () => {
       customAnswer: "doesn't matter",
     });
   });
+
+  it("keeps choice-only prompts on the selected option", () => {
+    expect(
+      resolvePendingUserInputAnswer(choiceOnlyQuestion, {
+        selectedOptionLabel: "Orchestration-first",
+        customAnswer: "Something else",
+      }),
+    ).toBe("Orchestration-first");
+  });
+
+  it("ignores custom draft text for choice-only prompts", () => {
+    expect(
+      setPendingUserInputCustomAnswer(
+        choiceOnlyQuestion,
+        {
+          selectedOptionLabel: "Orchestration-first",
+        },
+        "Something else",
+      ),
+    ).toEqual({
+      selectedOptionLabel: "Orchestration-first",
+      customAnswer: "",
+    });
+    expect(allowsPendingUserInputCustomAnswer(choiceOnlyQuestion)).toBe(false);
+  });
 });
 
 describe("buildPendingUserInputAnswers", () => {
@@ -47,28 +100,8 @@ describe("buildPendingUserInputAnswers", () => {
     expect(
       buildPendingUserInputAnswers(
         [
-          {
-            id: "scope",
-            header: "Scope",
-            question: "What should the plan target first?",
-            options: [
-              {
-                label: "Orchestration-first",
-                description: "Focus on orchestration first",
-              },
-            ],
-          },
-          {
-            id: "compat",
-            header: "Compat",
-            question: "How strict should compatibility be?",
-            options: [
-              {
-                label: "Keep current envelope",
-                description: "Preserve current wire format",
-              },
-            ],
-          },
+          choiceOnlyQuestion,
+          freeformQuestion,
         ],
         {
           scope: {
@@ -89,17 +122,7 @@ describe("buildPendingUserInputAnswers", () => {
     expect(
       buildPendingUserInputAnswers(
         [
-          {
-            id: "scope",
-            header: "Scope",
-            question: "What should the plan target first?",
-            options: [
-              {
-                label: "Orchestration-first",
-                description: "Focus on orchestration first",
-              },
-            ],
-          },
+          choiceOnlyQuestion,
         ],
         {},
       ),
@@ -108,30 +131,7 @@ describe("buildPendingUserInputAnswers", () => {
 });
 
 describe("pending user input question progress", () => {
-  const questions = [
-    {
-      id: "scope",
-      header: "Scope",
-      question: "What should the plan target first?",
-      options: [
-        {
-          label: "Orchestration-first",
-          description: "Focus on orchestration first",
-        },
-      ],
-    },
-    {
-      id: "compat",
-      header: "Compat",
-      question: "How strict should compatibility be?",
-      options: [
-        {
-          label: "Keep current envelope",
-          description: "Preserve current wire format",
-        },
-      ],
-    },
-  ] as const;
+  const questions = [choiceOnlyQuestion, freeformQuestion] as const;
 
   it("counts only answered questions", () => {
     expect(

@@ -10,7 +10,7 @@ import {
   TrimmedNonEmptyString,
   TurnId,
 } from "./baseSchemas";
-import { ProviderKind } from "./orchestration";
+import { AssistantDeliveryMode, ProviderKind } from "./orchestration";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
@@ -321,6 +321,7 @@ export type ThreadRealtimeClosedPayload = typeof ThreadRealtimeClosedPayload.Typ
 const TurnStartedPayload = Schema.Struct({
   model: Schema.optional(TrimmedNonEmptyStringSchema),
   effort: Schema.optional(TrimmedNonEmptyStringSchema),
+  assistantDeliveryMode: Schema.optional(AssistantDeliveryMode),
 });
 export type TurnStartedPayload = typeof TurnStartedPayload.Type;
 
@@ -408,6 +409,7 @@ export const UserInputQuestion = Schema.Struct({
   header: TrimmedNonEmptyStringSchema,
   question: TrimmedNonEmptyStringSchema,
   options: Schema.Array(UserInputQuestionOption),
+  allowFreeform: Schema.optional(Schema.Boolean),
 });
 export type UserInputQuestion = typeof UserInputQuestion.Type;
 

@@ -254,7 +254,7 @@ const makeServerProgram = (input: CliInput) =>
     }
 
     yield* start;
-    yield* Effect.forkChild(recordStartupHeartbeat);
+    yield* recordStartupHeartbeat.pipe(Effect.forkDetach);
 
     const localUrl = `http://localhost:${config.port}`;
     const bindUrl =

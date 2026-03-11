@@ -503,6 +503,41 @@ const makeProviderService = (options?: ProviderServiceLiveOptions) =>
             provider: event.provider,
             runtimePayload: {
               activeTurnId: null,
+              [PENDING_APPROVAL_REQUESTS_KEY]: [],
+              [PENDING_USER_INPUT_REQUESTS_KEY]: [],
+            },
+          });
+        }
+        case "session.state.changed": {
+          return directory.upsert({
+            threadId: event.threadId,
+            provider: event.provider,
+            status:
+              event.payload.state === "error"
+                ? "error"
+                : event.payload.state === "stopped"
+                  ? "stopped"
+                  : event.payload.state === "starting"
+                    ? "starting"
+                    : "running",
+            runtimePayload: {
+              ...(event.payload.state === "error" || event.payload.state === "stopped"
+                ? { activeTurnId: null }
+                : {}),
+              ...(typeof event.payload.reason === "string" ? { lastError: event.payload.reason } : {}),
+            },
+          });
+        }
+        case "session.exited": {
+          return directory.upsert({
+            threadId: event.threadId,
+            provider: event.provider,
+            status: event.payload.exitKind === "error" ? "error" : "stopped",
+            runtimePayload: {
+              activeTurnId: null,
+              [PENDING_APPROVAL_REQUESTS_KEY]: [],
+              [PENDING_USER_INPUT_REQUESTS_KEY]: [],
+              ...(typeof event.payload.reason === "string" ? { lastError: event.payload.reason } : {}),
             },
           });
         }

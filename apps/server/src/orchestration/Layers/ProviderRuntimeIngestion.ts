@@ -78,6 +78,14 @@ function normalizeProposedPlanMarkdown(planMarkdown: string | undefined): string
   return trimmed;
 }
 
+function assistantDeliveryThreadKey(threadId: ThreadId): string {
+  return String(threadId);
+}
+
+function assistantDeliveryTurnKey(threadId: ThreadId, turnId: TurnId): string {
+  return `${threadId}:${turnId}`;
+}
+
 function proposedPlanIdForTurn(threadId: ThreadId, turnId: TurnId): string {
   return `plan:${threadId}:turn:${turnId}`;
 }
@@ -95,6 +103,10 @@ function proposedPlanIdFromEvent(event: ProviderRuntimeEvent, threadId: ThreadId
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function parseAssistantDeliveryMode(value: unknown): AssistantDeliveryMode | undefined {
+  return value === "streaming" || value === "buffered" ? value : undefined;
 }
 
 function runtimePayloadRecord(event: ProviderRuntimeEvent): Record<string, unknown> | undefined {
@@ -449,6 +461,7 @@ function runtimeEventToActivities(
           payload: {
             itemType: event.payload.itemType,
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
+            ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -470,6 +483,29 @@ function runtimeEventToActivities(
           payload: {
             itemType: event.payload.itemType,
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
+            ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
+    case "tool.progress": {
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "tool",
+          kind: "tool.progress",
+          summary: event.payload.toolName ?? event.payload.summary ?? "Tool progress",
+          payload: {
+            ...(event.payload.toolUseId ? { toolUseId: event.payload.toolUseId } : {}),
+            ...(event.payload.toolName ? { toolName: event.payload.toolName } : {}),
+            ...(event.payload.summary ? { detail: truncateDetail(event.payload.summary) } : {}),
+            ...(event.payload.elapsedSeconds !== undefined
+              ? { elapsedSeconds: event.payload.elapsedSeconds }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -489,9 +525,10 @@ const make = Effect.gen(function* () {
   const providerService = yield* ProviderService;
   const providerSessionDirectory = yield* ProviderSessionDirectory;
 
-  const assistantDeliveryModeRef = yield* Ref.make<AssistantDeliveryMode>(
-    DEFAULT_ASSISTANT_DELIVERY_MODE,
+  const pendingAssistantDeliveryModeByThreadRef = yield* Ref.make<Map<string, AssistantDeliveryMode>>(
+    new Map(),
   );
+  const assistantDeliveryModeByTurnRef = yield* Ref.make<Map<string, AssistantDeliveryMode>>(new Map());
 
   const turnMessageIdsByTurnKey = yield* Cache.make<string, Set<MessageId>>({
     capacity: TURN_MESSAGE_IDS_BY_TURN_CACHE_CAPACITY,
@@ -636,6 +673,99 @@ const make = Effect.gen(function* () {
     Cache.invalidate(bufferedProposedPlanById, planId);
 
   const clearAssistantMessageState = (messageId: MessageId) => clearBufferedAssistantText(messageId);
+
+  const setPendingAssistantDeliveryMode = (
+    threadId: ThreadId,
+    assistantDeliveryMode: AssistantDeliveryMode,
+  ) =>
+    Ref.update(pendingAssistantDeliveryModeByThreadRef, (current) => {
+      const next = new Map(current);
+      next.set(assistantDeliveryThreadKey(threadId), assistantDeliveryMode);
+      return next;
+    });
+
+  const getPendingAssistantDeliveryMode = (threadId: ThreadId) =>
+    Ref.get(pendingAssistantDeliveryModeByThreadRef).pipe(
+      Effect.map((current) => current.get(assistantDeliveryThreadKey(threadId))),
+    );
+
+  const clearPendingAssistantDeliveryMode = (threadId: ThreadId) =>
+    Ref.update(pendingAssistantDeliveryModeByThreadRef, (current) => {
+      const key = assistantDeliveryThreadKey(threadId);
+      if (!current.has(key)) {
+        return current;
+      }
+      const next = new Map(current);
+      next.delete(key);
+      return next;
+    });
+
+  const setAssistantDeliveryModeForTurn = (
+    threadId: ThreadId,
+    turnId: TurnId,
+    assistantDeliveryMode: AssistantDeliveryMode,
+  ) =>
+    Ref.update(assistantDeliveryModeByTurnRef, (current) => {
+      const next = new Map(current);
+      next.set(assistantDeliveryTurnKey(threadId, turnId), assistantDeliveryMode);
+      return next;
+    });
+
+  const getAssistantDeliveryModeForTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Ref.get(assistantDeliveryModeByTurnRef).pipe(
+      Effect.map((current) => current.get(assistantDeliveryTurnKey(threadId, turnId))),
+    );
+
+  const clearAssistantDeliveryModeForTurn = (threadId: ThreadId, turnId: TurnId) =>
+    Ref.update(assistantDeliveryModeByTurnRef, (current) => {
+      const key = assistantDeliveryTurnKey(threadId, turnId);
+      if (!current.has(key)) {
+        return current;
+      }
+      const next = new Map(current);
+      next.delete(key);
+      return next;
+    });
+
+  const clearAssistantDeliveryModeStateForThread = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      yield* Ref.update(pendingAssistantDeliveryModeByThreadRef, (current) => {
+        const key = assistantDeliveryThreadKey(threadId);
+        if (!current.has(key)) {
+          return current;
+        }
+        const next = new Map(current);
+        next.delete(key);
+        return next;
+      });
+      yield* Ref.update(assistantDeliveryModeByTurnRef, (current) => {
+        const prefix = `${threadId}:`;
+        const next = new Map(current);
+        let changed = false;
+        for (const key of next.keys()) {
+          if (key.startsWith(prefix)) {
+            next.delete(key);
+            changed = true;
+          }
+        }
+        return changed ? next : current;
+      });
+    });
+
+  const resolveAssistantDeliveryMode = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    turnId: TurnId | undefined,
+  ) {
+    if (turnId) {
+      const turnMode = yield* getAssistantDeliveryModeForTurn(threadId, turnId);
+      if (turnMode !== undefined) {
+        return turnMode;
+      }
+    }
+    return (
+      (yield* getPendingAssistantDeliveryMode(threadId)) ?? DEFAULT_ASSISTANT_DELIVERY_MODE
+    );
+  });
 
   const finalizeAssistantMessage = (input: {
     event: ProviderRuntimeEvent;
@@ -801,6 +931,20 @@ const make = Effect.gen(function* () {
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
       const activeTurnId = thread.session?.activeTurnId ?? null;
+      const runtimeAssistantDeliveryMode = parseAssistantDeliveryMode(
+        runtimePayloadRecord(event)?.assistantDeliveryMode,
+      );
+
+      if (event.type === "turn.started" && eventTurnId) {
+        const assistantDeliveryMode =
+          runtimeAssistantDeliveryMode ??
+          (yield* getPendingAssistantDeliveryMode(thread.id)) ??
+          DEFAULT_ASSISTANT_DELIVERY_MODE;
+        yield* setAssistantDeliveryModeForTurn(thread.id, eventTurnId, assistantDeliveryMode);
+        yield* clearPendingAssistantDeliveryMode(thread.id);
+      } else if ((event.type === "turn.completed" || event.type === "turn.aborted") && eventTurnId) {
+        yield* clearAssistantDeliveryModeForTurn(thread.id, eventTurnId);
+      }
 
       const conflictsWithActiveTurn =
         activeTurnId !== null && eventTurnId !== undefined && !sameId(activeTurnId, eventTurnId);
@@ -908,7 +1052,7 @@ const make = Effect.gen(function* () {
           yield* rememberAssistantMessageId(thread.id, turnId, assistantMessageId);
         }
 
-        const assistantDeliveryMode = yield* Ref.get(assistantDeliveryModeRef);
+        const assistantDeliveryMode = yield* resolveAssistantDeliveryMode(thread.id, turnId);
         if (assistantDeliveryMode === "buffered") {
           const spillChunk = yield* appendBufferedAssistantText(assistantMessageId, assistantDelta);
           if (spillChunk.length > 0) {
@@ -1029,6 +1173,7 @@ const make = Effect.gen(function* () {
       }
 
       if (event.type === "session.exited") {
+        yield* clearAssistantDeliveryModeStateForThread(thread.id);
         yield* clearTurnStateForSession(thread.id);
       }
 
@@ -1104,10 +1249,21 @@ const make = Effect.gen(function* () {
     });
 
   const processDomainEvent = (event: TurnStartRequestedDomainEvent) =>
-    Ref.set(
-      assistantDeliveryModeRef,
-      event.payload.assistantDeliveryMode ?? DEFAULT_ASSISTANT_DELIVERY_MODE,
-    );
+    Effect.gen(function* () {
+      const assistantDeliveryMode =
+        event.payload.assistantDeliveryMode ?? DEFAULT_ASSISTANT_DELIVERY_MODE;
+      const readModel = yield* orchestrationEngine.getReadModel();
+      const thread = readModel.threads.find((entry) => entry.id === event.payload.threadId);
+      const activeTurnId = thread?.session?.activeTurnId ?? null;
+
+      if (activeTurnId) {
+        yield* setAssistantDeliveryModeForTurn(event.payload.threadId, activeTurnId, assistantDeliveryMode);
+        yield* clearPendingAssistantDeliveryMode(event.payload.threadId);
+        return;
+      }
+
+      yield* setPendingAssistantDeliveryMode(event.payload.threadId, assistantDeliveryMode);
+    });
 
   const processInput = (input: RuntimeIngestionInput) =>
     input.source === "runtime" ? processRuntimeEvent(input.event) : processDomainEvent(input.event);

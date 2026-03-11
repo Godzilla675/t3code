@@ -1,5 +1,6 @@
 import {
   ApprovalRequestId,
+  type AssistantDeliveryMode,
   type OrchestrationLatestTurn,
   type OrchestrationThreadActivity,
   type OrchestrationProposedPlanId,
@@ -35,7 +36,7 @@ export interface WorkLogEntry {
 
 export interface PendingApproval {
   requestId: ApprovalRequestId;
-  requestKind: "command" | "file-read" | "file-change";
+  requestKind: "command" | "file-read" | "file-change" | "tool-call" | "auth" | "other";
   createdAt: string;
   detail?: string;
 }
@@ -139,9 +140,21 @@ export function deriveActiveWorkStartedAt(
   return sendStartedAt;
 }
 
-function requestKindFromRequestType(
-  requestType: unknown,
-): PendingApproval["requestKind"] | null {
+function normalizePendingApprovalKind(value: unknown): PendingApproval["requestKind"] | null {
+  switch (value) {
+    case "command":
+    case "file-read":
+    case "file-change":
+    case "tool-call":
+    case "auth":
+    case "other":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function requestKindFromRequestType(requestType: unknown): PendingApproval["requestKind"] {
   switch (requestType) {
     case "command_execution_approval":
     case "exec_command_approval":
@@ -151,9 +164,37 @@ function requestKindFromRequestType(
     case "file_change_approval":
     case "apply_patch_approval":
       return "file-change";
+    case "dynamic_tool_call":
+    case "tool_user_input":
+      return "tool-call";
+    case "auth_tokens_refresh":
+      return "auth";
     default:
-      return null;
+      return "other";
   }
+}
+
+function detailIncludes(detail: string | undefined, candidates: ReadonlyArray<string>): boolean {
+  if (!detail) {
+    return false;
+  }
+  const normalized = detail.toLowerCase();
+  return candidates.some((candidate) => normalized.includes(candidate));
+}
+
+function isUnknownPendingApprovalDetail(detail: string | undefined): boolean {
+  return detailIncludes(detail, [
+    "unknown pending approval request",
+    "unknown pending permission request",
+    "unknown pending copilot approval request",
+  ]);
+}
+
+function isUnknownPendingUserInputDetail(detail: string | undefined): boolean {
+  return detailIncludes(detail, [
+    "unknown pending user input request",
+    "unknown pending copilot user input request",
+  ]);
 }
 
 export function derivePendingApprovals(
@@ -172,14 +213,10 @@ export function derivePendingApprovals(
         ? ApprovalRequestId.makeUnsafe(payload.requestId)
         : null;
     const requestKind =
-      payload &&
-      (payload.requestKind === "command" ||
-        payload.requestKind === "file-read" ||
-        payload.requestKind === "file-change")
-        ? payload.requestKind
-        : payload
-          ? requestKindFromRequestType(payload.requestType)
-          : null;
+      payload
+        ? (normalizePendingApprovalKind(payload.requestKind) ??
+          requestKindFromRequestType(payload.requestType))
+        : null;
     const detail = payload && typeof payload.detail === "string" ? payload.detail : undefined;
 
     if (activity.kind === "approval.requested" && requestId && requestKind) {
@@ -200,7 +237,7 @@ export function derivePendingApprovals(
     if (
       activity.kind === "provider.approval.respond.failed" &&
       requestId &&
-      detail?.includes("Unknown pending permission request")
+      isUnknownPendingApprovalDetail(detail)
     ) {
       openByRequestId.delete(requestId);
       continue;
@@ -247,12 +284,20 @@ function parseUserInputQuestions(
           };
         })
         .filter((option): option is UserInputQuestion["options"][number] => option !== null);
-      return {
-        id: question.id,
-        header: question.header,
-        question: question.question,
-        options,
-      };
+      return typeof question.allowFreeform === "boolean"
+        ? {
+            id: question.id,
+            header: question.header,
+            question: question.question,
+            options,
+            allowFreeform: question.allowFreeform,
+          }
+        : {
+            id: question.id,
+            header: question.header,
+            question: question.question,
+            options,
+          };
     })
     .filter((question): question is UserInputQuestion => question !== null);
   return parsed.length > 0 ? parsed : null;
@@ -288,6 +333,17 @@ export function derivePendingUserInputs(
     }
 
     if (activity.kind === "user-input.resolved" && requestId) {
+      openByRequestId.delete(requestId);
+      continue;
+    }
+
+    if (
+      activity.kind === "provider.user-input.respond.failed" &&
+      requestId &&
+      isUnknownPendingUserInputDetail(
+        payload && typeof payload.detail === "string" ? payload.detail : undefined,
+      )
+    ) {
       openByRequestId.delete(requestId);
     }
   }
@@ -467,10 +523,12 @@ function extractToolCommand(payload: Record<string, unknown> | null): string | n
   const item = asRecord(data?.item);
   const itemResult = asRecord(item?.result);
   const itemInput = asRecord(item?.input);
+  const dataArguments = asRecord(data?.arguments);
   const candidates = [
     normalizeCommandValue(item?.command),
     normalizeCommandValue(itemInput?.command),
     normalizeCommandValue(itemResult?.command),
+    normalizeCommandValue(dataArguments?.command),
     normalizeCommandValue(data?.command),
   ];
   return candidates.find((candidate) => candidate !== null) ?? null;
@@ -520,6 +578,7 @@ function collectChangedFiles(
     "item",
     "result",
     "input",
+    "arguments",
     "data",
     "changes",
     "files",
@@ -568,6 +627,66 @@ export function hasToolActivityForTurn(
 ): boolean {
   if (!turnId) return false;
   return activities.some((activity) => activity.turnId === turnId && activity.tone === "tool");
+}
+
+export function resolveAssistantDeliveryModeForProvider(
+  provider: ProviderKind,
+  enableAssistantStreaming: boolean,
+): AssistantDeliveryMode {
+  if (enableAssistantStreaming || provider === "copilot") {
+    return "streaming";
+  }
+  return "buffered";
+}
+
+export function findWorkGroupIdBeforeEntry(
+  timelineEntries: ReadonlyArray<TimelineEntry>,
+  entryId: string | null,
+): string | null {
+  if (!entryId) return null;
+  const targetIndex = timelineEntries.findIndex((entry) => entry.id === entryId);
+  if (targetIndex <= 0) return null;
+
+  let workGroupId: string | null = null;
+  for (let index = targetIndex - 1; index >= 0; index -= 1) {
+    const entry = timelineEntries[index];
+    if (!entry) continue;
+    if (entry.kind === "work") {
+      workGroupId = entry.id;
+      continue;
+    }
+    break;
+  }
+
+  return workGroupId;
+}
+
+export function applyDefaultExpandedWorkGroup(
+  expandedWorkGroups: Readonly<Record<string, boolean>>,
+  latestCompletedWorkGroupId: string | null,
+): Readonly<Record<string, boolean>> {
+  if (!latestCompletedWorkGroupId) {
+    return expandedWorkGroups;
+  }
+  if (expandedWorkGroups[latestCompletedWorkGroupId] !== undefined) {
+    return expandedWorkGroups;
+  }
+  return {
+    ...expandedWorkGroups,
+    [latestCompletedWorkGroupId]: true,
+  };
+}
+
+export function toggleWorkGroupExpansion(
+  expandedWorkGroups: Readonly<Record<string, boolean>>,
+  groupId: string,
+  latestCompletedWorkGroupId: string | null,
+): Record<string, boolean> {
+  const isExpanded = expandedWorkGroups[groupId] ?? groupId === latestCompletedWorkGroupId;
+  return {
+    ...expandedWorkGroups,
+    [groupId]: !isExpanded,
+  };
 }
 
 export function deriveTimelineEntries(

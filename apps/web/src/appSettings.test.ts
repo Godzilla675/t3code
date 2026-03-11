@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER,
   getProviderStartOptions,
   getAppModelOptions,
+  getRuntimeModelOptionsByProvider,
   getSlashModelOptions,
   inferProviderForAppModel,
   normalizeCustomModelSlugs,
@@ -85,17 +87,17 @@ describe("getAppModelOptions", () => {
       "copilot",
       ["custom/copilot-model"],
       undefined,
-        [
-          {
-            slug: "claude-sonnet-4.6",
-            name: "Claude Sonnet 4.6",
-            supportsVision: true,
-            supportedReasoningEfforts: ["medium", "low"],
-            defaultReasoningEffort: "medium",
-          },
-          { slug: "gpt-5.4", name: "GPT-5.4", supportsVision: false },
-        ],
-      );
+      [
+        {
+          slug: "claude-sonnet-4.6",
+          name: "Claude Sonnet 4.6",
+          supportsVision: true,
+          supportedReasoningEfforts: ["medium", "low"],
+          defaultReasoningEffort: "medium",
+        },
+        { slug: "gpt-5.4", name: "GPT-5.4", supportsVision: false },
+      ],
+    );
 
     expect(options.map((option) => option.slug)).toEqual([
       "claude-sonnet-4.6",
@@ -109,6 +111,98 @@ describe("getAppModelOptions", () => {
     });
     expect(options[1]).toMatchObject({
       supportsVision: false,
+    });
+  });
+});
+
+describe("getRuntimeModelOptionsByProvider", () => {
+  it("uses live provider statuses when runtime model metadata is present", () => {
+    expect(
+      getRuntimeModelOptionsByProvider([
+        {
+          provider: "copilot",
+          availableModels: [
+            {
+              slug: "claude-sonnet-4.6",
+              name: "Claude Sonnet 4.6",
+              supportedReasoningEfforts: ["medium", "low"],
+              defaultReasoningEffort: "medium",
+            },
+          ],
+        },
+      ]),
+    ).toEqual({
+      codex: [],
+      copilot: [
+        {
+          slug: "claude-sonnet-4.6",
+          name: "Claude Sonnet 4.6",
+          supportedReasoningEfforts: ["medium", "low"],
+          defaultReasoningEffort: "medium",
+        },
+      ],
+    });
+  });
+
+  it("falls back to cached runtime model metadata when the current provider status omits models", () => {
+    expect(
+      getRuntimeModelOptionsByProvider([], {
+        ...EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER,
+        copilot: [
+          {
+            slug: "gpt-5.4",
+            name: "GPT-5.4",
+            supportedReasoningEfforts: ["high", "medium", "low"],
+            defaultReasoningEffort: "medium",
+          },
+        ],
+      }),
+    ).toEqual({
+      codex: [],
+      copilot: [
+        {
+          slug: "gpt-5.4",
+          name: "GPT-5.4",
+          supportedReasoningEfforts: ["high", "medium", "low"],
+          defaultReasoningEffort: "medium",
+        },
+      ],
+    });
+  });
+
+  it("merges cached Copilot reasoning metadata into degraded live model entries", () => {
+    expect(
+      getRuntimeModelOptionsByProvider(
+        [
+          {
+            provider: "copilot",
+            availableModels: [{ slug: "gpt-5.4", name: "GPT-5.4", supportsVision: false }],
+          },
+        ],
+        {
+          ...EMPTY_RUNTIME_MODEL_OPTIONS_BY_PROVIDER,
+          copilot: [
+            {
+              slug: "gpt-5.4",
+              name: "GPT-5.4",
+              supportsVision: false,
+              supportedReasoningEfforts: ["high", "medium", "low"],
+              defaultReasoningEffort: "medium",
+            },
+          ],
+        },
+      ),
+    ).toEqual({
+      codex: [],
+      copilot: [
+        {
+          slug: "gpt-5.4",
+          name: "GPT-5.4",
+          supportsVision: false,
+          supportedReasoningEfforts: ["high", "medium", "low"],
+          defaultReasoningEffort: "medium",
+        },
+      ],
     });
   });
 });

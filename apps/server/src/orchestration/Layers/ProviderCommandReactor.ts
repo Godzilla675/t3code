@@ -1,4 +1,5 @@
 import {
+  type AssistantDeliveryMode,
   type ChatAttachment,
   CommandId,
   EventId,
@@ -394,6 +395,7 @@ const make = Effect.gen(function* () {
     readonly modelOptions?: ProviderModelOptions;
     readonly serviceTier?: ProviderServiceTier | null;
     readonly interactionMode?: "default" | "plan";
+    readonly assistantDeliveryMode?: AssistantDeliveryMode;
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
@@ -429,6 +431,9 @@ const make = Effect.gen(function* () {
       ...(modelForTurn !== undefined ? { model: modelForTurn } : {}),
       ...(input.modelOptions !== undefined ? { modelOptions: input.modelOptions } : {}),
       ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+      ...(input.assistantDeliveryMode !== undefined
+        ? { assistantDeliveryMode: input.assistantDeliveryMode }
+        : {}),
     });
   });
 
@@ -547,6 +552,9 @@ const make = Effect.gen(function* () {
       ...(event.payload.modelOptions !== undefined ? { modelOptions: event.payload.modelOptions } : {}),
       ...(event.payload.providerOptions !== undefined ? { providerOptions: event.payload.providerOptions } : {}),
       interactionMode: event.payload.interactionMode,
+      ...(event.payload.assistantDeliveryMode !== undefined
+        ? { assistantDeliveryMode: event.payload.assistantDeliveryMode }
+        : {}),
       createdAt: event.payload.createdAt,
     });
   });

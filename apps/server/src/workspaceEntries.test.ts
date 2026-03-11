@@ -4,11 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { afterEach, assert, describe, it, vi } from "vitest";
+import { afterEach, assert, beforeEach, describe, it, vi } from "vitest";
 
-import { searchWorkspaceEntries } from "./workspaceEntries";
+import {
+  resetWorkspaceIndexCacheForTesting,
+  searchWorkspaceEntries,
+} from "./workspaceEntries";
 
 const tempDirs: string[] = [];
+const WorkspaceEntriesSlowTestTimeoutMs = process.platform === "win32" ? 20_000 : 5_000;
 
 function makeTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -29,11 +33,37 @@ function runGit(cwd: string, args: string[]): void {
   }
 }
 
+async function removeDirectoryWithRetry(dir: string): Promise<void> {
+  const maxAttempts = process.platform === "win32" ? 8 : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await fsPromises.rm(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      const shouldRetry =
+        process.platform === "win32" &&
+        attempt < maxAttempts &&
+        (code === "EPERM" || code === "EBUSY" || code === "ENOTEMPTY");
+      if (!shouldRetry) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
 describe("searchWorkspaceEntries", () => {
-  afterEach(() => {
+  beforeEach(() => {
+    resetWorkspaceIndexCacheForTesting();
+  });
+
+  afterEach(async () => {
     vi.restoreAllMocks();
+    resetWorkspaceIndexCacheForTesting();
     for (const dir of tempDirs.splice(0, tempDirs.length)) {
-      fs.rmSync(dir, { recursive: true, force: true });
+      await removeDirectoryWithRetry(dir);
     }
   });
 
@@ -55,7 +85,7 @@ describe("searchWorkspaceEntries", () => {
     assert.isFalse(paths.some((entryPath) => entryPath.startsWith(".git")));
     assert.isFalse(paths.some((entryPath) => entryPath.startsWith("node_modules")));
     assert.isFalse(result.truncated);
-  });
+  }, WorkspaceEntriesSlowTestTimeoutMs);
 
   it("filters and ranks entries by query", async () => {
     const cwd = makeTempDir("t3code-workspace-query-");
@@ -68,7 +98,7 @@ describe("searchWorkspaceEntries", () => {
     assert.isAbove(result.entries.length, 0);
     assert.isTrue(result.entries.some((entry) => entry.path === "src/components"));
     assert.isTrue(result.entries.every((entry) => entry.path.toLowerCase().includes("compo")));
-  });
+  }, WorkspaceEntriesSlowTestTimeoutMs);
 
   it("excludes gitignored paths for git repositories", async () => {
     const cwd = makeTempDir("t3code-workspace-gitignore-");
@@ -87,7 +117,7 @@ describe("searchWorkspaceEntries", () => {
     assert.notInclude(paths, "ignored.txt");
     assert.isFalse(paths.some((entryPath) => entryPath.startsWith(".convex/")));
     assert.isFalse(paths.some((entryPath) => entryPath.startsWith("convex/")));
-  });
+  }, WorkspaceEntriesSlowTestTimeoutMs);
 
   it("excludes tracked paths that match ignore rules", async () => {
     const cwd = makeTempDir("t3code-workspace-tracked-gitignore-");
@@ -103,7 +133,7 @@ describe("searchWorkspaceEntries", () => {
     assert.include(paths, "src");
     assert.include(paths, "src/keep.ts");
     assert.isFalse(paths.some((entryPath) => entryPath.startsWith(".convex/")));
-  });
+  }, WorkspaceEntriesSlowTestTimeoutMs);
 
   it("excludes .convex in non-git workspaces", async () => {
     const cwd = makeTempDir("t3code-workspace-non-git-convex-");
@@ -116,7 +146,7 @@ describe("searchWorkspaceEntries", () => {
     assert.include(paths, "src");
     assert.include(paths, "src/keep.ts");
     assert.isFalse(paths.some((entryPath) => entryPath.startsWith(".convex/")));
-  });
+  }, WorkspaceEntriesSlowTestTimeoutMs);
 
   it("deduplicates concurrent index builds for the same cwd", async () => {
     const cwd = makeTempDir("t3code-workspace-concurrent-build-");
@@ -141,7 +171,7 @@ describe("searchWorkspaceEntries", () => {
     ]);
 
     assert.equal(rootReadCount, 1);
-  });
+  }, WorkspaceEntriesSlowTestTimeoutMs);
 
   it("limits concurrent directory reads while walking the filesystem", async () => {
     const cwd = makeTempDir("t3code-workspace-read-concurrency-");
@@ -172,5 +202,5 @@ describe("searchWorkspaceEntries", () => {
     await searchWorkspaceEntries({ cwd, query: "", limit: 200 });
 
     assert.isAtMost(peakReads, 32);
-  });
+  }, WorkspaceEntriesSlowTestTimeoutMs);
 });

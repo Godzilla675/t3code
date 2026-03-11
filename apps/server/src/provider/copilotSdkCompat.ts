@@ -95,6 +95,11 @@ async function importCopilotSdk(): Promise<CopilotSdkModule> {
 }
 
 export async function loadCopilotSdk(): Promise<CopilotSdkModule> {
-  copilotSdkPromise ??= importCopilotSdk();
+  if (!copilotSdkPromise) {
+    copilotSdkPromise = importCopilotSdk().catch((error: unknown) => {
+      copilotSdkPromise = undefined;
+      throw error;
+    });
+  }
   return copilotSdkPromise;
 }

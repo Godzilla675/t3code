@@ -10,7 +10,7 @@ import {
   EventId,
   MessageId,
   ProjectId,
-  ProviderItemId,
+  RuntimeItemId,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -37,7 +37,7 @@ import { ServerConfig } from "../../config.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 const asProjectId = (value: string): ProjectId => ProjectId.makeUnsafe(value);
-const asItemId = (value: string): ProviderItemId => ProviderItemId.makeUnsafe(value);
+const asItemId = (value: string): RuntimeItemId => RuntimeItemId.makeUnsafe(value);
 const asEventId = (value: string): EventId => EventId.makeUnsafe(value);
 const asMessageId = (value: string): MessageId => MessageId.makeUnsafe(value);
 const asThreadId = (value: string): ThreadId => ThreadId.makeUnsafe(value);
@@ -917,6 +917,185 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(finalMessage?.text).toBe("hello live");
     expect(finalMessage?.streaming).toBe(false);
+  });
+
+  it("keeps streaming mode isolated per thread", async () => {
+    const harness = await createHarness();
+    harness.setBindingProvider("copilot");
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.makeUnsafe("cmd-thread-create-2"),
+        threadId: ThreadId.makeUnsafe("thread-2"),
+        projectId: asProjectId("project-1"),
+        title: "Thread 2",
+        model: "gpt-5-codex",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: now,
+      }),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-streaming-thread-1"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        message: {
+          messageId: asMessageId("message-thread-1"),
+          role: "user",
+          text: "stream thread one",
+          attachments: [],
+        },
+        assistantDeliveryMode: "streaming",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.makeUnsafe("cmd-turn-start-buffered-thread-2"),
+        threadId: ThreadId.makeUnsafe("thread-2"),
+        message: {
+          messageId: asMessageId("message-thread-2"),
+          role: "user",
+          text: "buffer thread two",
+          attachments: [],
+        },
+        assistantDeliveryMode: "buffered",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-thread-1"),
+      provider: "copilot",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-thread-1"),
+      payload: {
+        assistantDeliveryMode: "streaming",
+      },
+    });
+
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-message-delta-thread-1"),
+      provider: "copilot",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-thread-1"),
+      itemId: asItemId("item-thread-1"),
+      payload: {
+        streamKind: "assistant_text",
+        delta: "hello from thread one",
+      },
+    });
+
+    const liveThread = await waitForThread(harness.engine, (entry) =>
+      entry.id === "thread-1" &&
+      entry.messages.some(
+        (message: ProviderRuntimeTestMessage) =>
+          message.id === "assistant:item-thread-1" &&
+          message.streaming &&
+          message.text === "hello from thread one",
+      ),
+    );
+    const liveMessage = liveThread.messages.find(
+      (entry: ProviderRuntimeTestMessage) => entry.id === "assistant:item-thread-1",
+    );
+    expect(liveMessage?.streaming).toBe(true);
+  });
+
+  it("maps tool progress and preserves completed tool data", async () => {
+    const harness = await createHarness();
+    harness.setBindingProvider("copilot");
+    const now = new Date().toISOString();
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-tool-turn-started"),
+      provider: "copilot",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-tool-1"),
+      payload: {},
+    });
+    harness.emit({
+      type: "tool.progress",
+      eventId: asEventId("evt-tool-progress"),
+      provider: "copilot",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-tool-1"),
+      payload: {
+        toolUseId: "tool-1",
+        toolName: "powershell",
+        summary: "Running command",
+      },
+    });
+    harness.emit({
+      type: "item.completed",
+      eventId: asEventId("evt-tool-completed"),
+      provider: "copilot",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-tool-1"),
+      itemId: asItemId("item-tool-1"),
+      payload: {
+        itemType: "command_execution",
+        status: "completed",
+        title: "powershell",
+        detail: "done",
+        data: {
+          arguments: {
+            command: ["bun", "run", "test"],
+          },
+        },
+      },
+    });
+
+    const thread = await waitForThread(
+      harness.engine,
+      (entry) =>
+        entry.activities.some(
+          (activity: ProviderRuntimeTestActivity) => activity.id === "evt-tool-progress",
+        ) &&
+        entry.activities.some(
+          (activity: ProviderRuntimeTestActivity) => activity.id === "evt-tool-completed",
+        ),
+    );
+
+    const progress = thread.activities.find(
+      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-tool-progress",
+    );
+    const completed = thread.activities.find(
+      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-tool-completed",
+    );
+    const completedPayload =
+      completed?.payload && typeof completed.payload === "object"
+        ? (completed.payload as Record<string, unknown>)
+        : undefined;
+
+    expect(progress?.kind).toBe("tool.progress");
+    expect(progress?.summary).toBe("powershell");
+    expect(completedPayload?.data).toEqual({
+      arguments: {
+        command: ["bun", "run", "test"],
+      },
+    });
   });
 
   it("spills oversized buffered deltas and still finalizes full assistant text", async () => {

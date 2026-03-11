@@ -11,6 +11,7 @@ import {
   TurnId,
 } from "./baseSchemas";
 import {
+  AssistantDeliveryMode,
   ChatAttachment,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
@@ -77,6 +78,7 @@ export const ProviderSendTurnInput = Schema.Struct({
   serviceTier: Schema.optional(Schema.NullOr(ProviderServiceTier)),
   modelOptions: Schema.optional(ProviderModelOptions),
   interactionMode: Schema.optional(ProviderInteractionMode),
+  assistantDeliveryMode: Schema.optional(AssistantDeliveryMode),
 });
 export type ProviderSendTurnInput = typeof ProviderSendTurnInput.Type;
 

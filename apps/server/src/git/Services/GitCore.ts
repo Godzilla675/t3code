@@ -26,6 +26,7 @@ import type { GitCommandError } from "../Errors.ts";
 
 export interface GitStatusDetails extends Omit<GitStatusResult, "pr"> {
   upstreamRef: string | null;
+  comparableBaseBranch: string | null;
 }
 
 export interface GitPreparedCommitContext {

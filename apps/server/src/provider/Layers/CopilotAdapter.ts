@@ -211,6 +211,7 @@ interface PendingUserInput {
 interface ToolLifecycleState {
   readonly itemType: CanonicalItemType;
   readonly title?: string;
+  readonly arguments?: unknown;
 }
 
 interface CopilotRuntimeEntry {
@@ -228,6 +229,9 @@ interface CopilotRuntimeEntry {
   lastPlanTurnId: TurnId | undefined;
   lastPlanMarkdown: string | undefined;
   lastUsage: Record<string, unknown> | undefined;
+  activeTurnHadToolActivity: boolean;
+  activeTurnHadCompletedAssistantMessage: boolean;
+  pendingToolOnlyCompletionTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 interface SessionPatch {
@@ -240,6 +244,7 @@ interface SessionPatch {
 const PROVIDER = "copilot" as const;
 const CLIENT_NAME = "t3code";
 const DEFAULT_QUESTION_ID = "response";
+const TOOL_ONLY_TURN_COMPLETION_GRACE_MS = 250;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -320,6 +325,14 @@ function touchSession(entry: CopilotRuntimeEntry, patch: SessionPatch, updatedAt
         ? { lastError: entry.providerSession.lastError }
         : {}),
   };
+}
+
+function cancelPendingToolOnlyCompletion(entry: CopilotRuntimeEntry): void {
+  if (entry.pendingToolOnlyCompletionTimer === undefined) {
+    return;
+  }
+  clearTimeout(entry.pendingToolOnlyCompletionTimer);
+  entry.pendingToolOnlyCompletionTimer = undefined;
 }
 
 function buildSdkRaw(event: CopilotSessionEvent): ProviderRuntimeEvent["raw"] {
@@ -434,6 +447,9 @@ function makeUserInputQuestions(request: CopilotUserInputRequest) {
       header: "Agent input required",
       question: request.question,
       options: choiceOptions,
+      ...(typeof request.allowFreeform === "boolean"
+        ? { allowFreeform: request.allowFreeform }
+        : {}),
     },
   ] as const;
 }
@@ -479,6 +495,10 @@ function extractUserInputAnswer(answers: ProviderUserInputAnswers): string | und
 
 function isChoiceAnswer(request: CopilotUserInputRequest, answer: string): boolean {
   return (request.choices ?? []).some((choice) => choice === answer);
+}
+
+function allowsFreeformAnswer(request: CopilotUserInputRequest): boolean {
+  return request.allowFreeform !== false;
 }
 
 function cloneSession(session: ProviderSession): ProviderSession {
@@ -730,52 +750,244 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
             exitKind,
             ...(exitKind === "error" ? { recoverable: true } : {}),
           },
+          },
+        ]);
+
+    const removeEntry = (entry: CopilotRuntimeEntry) => {
+      if (entry.pendingToolOnlyCompletionTimer !== undefined) {
+        clearTimeout(entry.pendingToolOnlyCompletionTimer);
+        entry.pendingToolOnlyCompletionTimer = undefined;
+      }
+      try {
+        entry.unsubscribe();
+      } catch {
+        // Ignore listener cleanup issues during shutdown.
+      }
+      if (entries.get(entry.threadId) === entry) {
+        entries.delete(entry.threadId);
+      }
+    };
+
+    const clearTurnState = (
+      entry: CopilotRuntimeEntry,
+      patch: SessionPatch,
+      updatedAt: string,
+    ): { readonly turnId: TurnId | undefined; readonly providerTurnId: string | undefined } => {
+      cancelPendingToolOnlyCompletion(entry);
+      const turnId = entry.activeTurnId;
+      const providerTurnId = entry.activeProviderTurnId;
+      entry.activeTurnId = undefined;
+      entry.activeProviderTurnId = undefined;
+      entry.toolCalls.clear();
+      entry.activeTurnHadToolActivity = false;
+      entry.activeTurnHadCompletedAssistantMessage = false;
+      touchSession(
+        entry,
+        {
+          ...patch,
+          activeTurnId: undefined,
         },
-      ]);
+        updatedAt,
+      );
+      return { turnId, providerTurnId };
+    };
+
+    const cancelPendingInteractiveRequests = (input: {
+      readonly entry: CopilotRuntimeEntry;
+      readonly createdAt: string;
+      readonly reason: string;
+    }): ReadonlyArray<ProviderRuntimeEvent> => {
+      const events: ProviderRuntimeEvent[] = [];
+
+      for (const pending of input.entry.pendingApprovals.values()) {
+        pending.reject(new Error(input.reason));
+        events.push({
+          ...makeRuntimeEventBase({
+            threadId: input.entry.threadId,
+            createdAt: input.createdAt,
+            turnId: pending.turnId,
+            requestId: pending.runtimeRequestId,
+            raw: {
+              source: "copilot.sdk.permission-request",
+              payload: {
+                request: pending.request,
+                reason: input.reason,
+              },
+            },
+          }),
+          type: "request.resolved",
+          payload: {
+            requestType: pending.requestType,
+            decision: "cancel",
+            resolution: {
+              decision: "cancel",
+              reason: input.reason,
+            },
+          },
+        });
+      }
+
+      for (const pending of input.entry.pendingUserInputs.values()) {
+        pending.reject(new Error(input.reason));
+        events.push({
+          ...makeRuntimeEventBase({
+            threadId: input.entry.threadId,
+            createdAt: input.createdAt,
+            turnId: pending.turnId,
+            requestId: pending.runtimeRequestId,
+            raw: {
+              source: "copilot.sdk.user-input-request",
+              payload: {
+                request: pending.request,
+                reason: input.reason,
+              },
+            },
+          }),
+          type: "user-input.resolved",
+          payload: {
+            answers: {},
+          },
+        });
+      }
+
+      input.entry.pendingApprovals.clear();
+      input.entry.pendingUserInputs.clear();
+      return events;
+    };
+
+    const scheduleToolOnlyTurnCompletion = (input: {
+      readonly entry: CopilotRuntimeEntry;
+      readonly raw: ProviderRuntimeEvent["raw"];
+      readonly emitIdleState: boolean;
+    }) => {
+      cancelPendingToolOnlyCompletion(input.entry);
+      const pendingTurnId = input.entry.activeTurnId;
+      if (pendingTurnId === undefined) {
+        return;
+      }
+
+      input.entry.pendingToolOnlyCompletionTimer = setTimeout(() => {
+        const currentEntry = entries.get(input.entry.threadId);
+        if (!currentEntry || currentEntry !== input.entry) {
+          return;
+        }
+        currentEntry.pendingToolOnlyCompletionTimer = undefined;
+        if (
+          currentEntry.activeTurnId !== pendingTurnId ||
+          currentEntry.activeTurnHadCompletedAssistantMessage
+        ) {
+          return;
+        }
+
+        const completedAt = now();
+        const cancelledEvents = cancelPendingInteractiveRequests({
+          entry: currentEntry,
+          createdAt: completedAt,
+          reason: "Copilot turn completed before the interactive request was resolved.",
+        });
+        const { turnId, providerTurnId } = clearTurnState(
+          currentEntry,
+          { status: "ready", lastError: undefined },
+          completedAt,
+        );
+        const usage = currentEntry.lastUsage;
+        currentEntry.lastUsage = undefined;
+
+        const completionEvents: Array<ProviderRuntimeEvent> = [
+          ...cancelledEvents,
+          {
+            ...makeRuntimeEventBase({
+              threadId: currentEntry.threadId,
+              createdAt: completedAt,
+              turnId,
+              providerTurnId,
+              raw: input.raw,
+            }),
+            type: "turn.completed",
+            payload: {
+              state: "completed",
+              ...(usage !== undefined ? { usage } : {}),
+            },
+          },
+        ];
+
+        if (input.emitIdleState) {
+          completionEvents.push({
+            ...makeRuntimeEventBase({
+              threadId: currentEntry.threadId,
+              createdAt: completedAt,
+              raw: input.raw,
+            }),
+            type: "thread.state.changed",
+            payload: {
+              state: "idle",
+              detail: {},
+            },
+          });
+        }
+
+        runDetached(emitRuntimeEvents(completionEvents));
+      }, TOOL_ONLY_TURN_COMPLETION_GRACE_MS);
+    };
 
     const stopEntry = (
       entry: CopilotRuntimeEntry,
       options: { readonly emitExit: boolean; readonly reason: string; readonly exitKind: "graceful" | "error" },
     ) =>
       Effect.gen(function* () {
-        yield* Effect.sync(() => {
-          try {
-            entry.unsubscribe();
-          } catch {
-            // Ignore listener cleanup issues during shutdown.
-          }
+        yield* Effect.sync(() => removeEntry(entry));
+        const createdAt = now();
+        const cancelledEvents = cancelPendingInteractiveRequests({
+          entry,
+          createdAt,
+          reason: "Copilot session stopped before the interactive request was resolved.",
         });
-
-        for (const pending of entry.pendingApprovals.values()) {
-          pending.reject(new Error("Copilot session stopped before the approval request was resolved."));
-        }
-        for (const pending of entry.pendingUserInputs.values()) {
-          pending.reject(new Error("Copilot session stopped before the input request was resolved."));
-        }
-        entry.pendingApprovals.clear();
-        entry.pendingUserInputs.clear();
         entry.toolCalls.clear();
 
+        let stopError: ProviderAdapterProcessError | undefined;
         const errors = yield* Effect.tryPromise({
           try: () => entry.client.stop(),
           catch: (cause) => toProcessError(entry.threadId, "Failed to stop Copilot client.", cause),
-        });
+        }).pipe(
+          Effect.catch((error: ProviderAdapterProcessError) =>
+            Effect.sync(() => {
+              stopError = error;
+              return [] as ReadonlyArray<Error>;
+            }),
+          ),
+        );
 
-        if (errors.length > 0) {
-          return yield* toProcessError(
+        if (!stopError && errors.length > 0) {
+          stopError = toProcessError(
             entry.threadId,
             errors.map((error) => error.message).join("; "),
             errors[0],
           );
         }
 
-        if (entries.get(entry.threadId) === entry) {
-          entries.delete(entry.threadId);
-        }
-        touchSession(entry, { status: "closed", activeTurnId: undefined }, now());
+        touchSession(
+          entry,
+          {
+            status: stopError ? "error" : "closed",
+            activeTurnId: undefined,
+            ...(stopError ? { lastError: stopError.detail } : {}),
+          },
+          now(),
+        );
 
         if (options.emitExit) {
-          yield* emitSessionShutdown(entry, options.reason, options.exitKind);
+          if (cancelledEvents.length > 0) {
+            yield* emitRuntimeEvents(cancelledEvents);
+          }
+          yield* emitSessionShutdown(
+            entry,
+            stopError?.detail ?? options.reason,
+            stopError ? "error" : options.exitKind,
+          );
+        }
+
+        if (stopError) {
+          return yield* stopError;
         }
       });
 
@@ -786,12 +998,13 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
       const createdAt = normalizeIsoTimestamp(event.timestamp, now);
       const raw = buildSdkRaw(event);
       const eventData = event.data ?? {};
+      cancelPendingToolOnlyCompletion(entry);
       const activeTurnId = entry.activeTurnId;
       const activeProviderTurnId = entry.activeProviderTurnId;
 
       switch (event.type) {
         case "assistant.turn_start": {
-      const providerTurnId = asTrimmedString(eventData.turnId);
+          const providerTurnId = asTrimmedString(eventData.turnId);
           if (providerTurnId) {
             entry.activeProviderTurnId = providerTurnId;
           }
@@ -800,6 +1013,8 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           }
           const createdTurnId = TurnId.makeUnsafe(generateId());
           entry.activeTurnId = createdTurnId;
+          entry.activeTurnHadToolActivity = false;
+          entry.activeTurnHadCompletedAssistantMessage = false;
           touchSession(entry, { status: "running", activeTurnId: createdTurnId }, createdAt);
           return [
             {
@@ -924,6 +1139,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           if (!messageId || !content) {
             return [];
           }
+          entry.activeTurnHadCompletedAssistantMessage = true;
           return [
             {
               ...makeRuntimeEventBase({
@@ -968,19 +1184,34 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           if (activeTurnId === undefined) {
             return [];
           }
-          touchSession(entry, { status: "ready", activeTurnId: undefined, lastError: undefined }, createdAt);
-          entry.activeTurnId = undefined;
-          entry.activeProviderTurnId = undefined;
-          entry.toolCalls.clear();
+          if (entry.activeTurnHadToolActivity && !entry.activeTurnHadCompletedAssistantMessage) {
+            scheduleToolOnlyTurnCompletion({
+              entry,
+              raw,
+              emitIdleState: false,
+            });
+            return [];
+          }
+          const cancelledEvents = cancelPendingInteractiveRequests({
+            entry,
+            createdAt,
+            reason: "Copilot turn completed before the interactive request was resolved.",
+          });
+          const { turnId, providerTurnId } = clearTurnState(
+            entry,
+            { status: "ready", lastError: undefined },
+            createdAt,
+          );
           const usage = entry.lastUsage;
           entry.lastUsage = undefined;
           return [
+            ...cancelledEvents,
             {
               ...makeRuntimeEventBase({
                 threadId: entry.threadId,
                 createdAt,
-                turnId: activeTurnId,
-                providerTurnId: activeProviderTurnId,
+                turnId,
+                providerTurnId,
                 raw,
               }),
               type: "turn.completed",
@@ -996,12 +1227,14 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           if (!toolCallId) {
             return [];
           }
+          entry.activeTurnHadToolActivity = true;
           const title = asTrimmedString(eventData.toolName);
           const itemType = inferToolItemType(title, eventData);
           const detail = safeJsonStringify(eventData.arguments);
           entry.toolCalls.set(toolCallId, {
             itemType,
             ...(title ? { title } : {}),
+            ...(eventData.arguments !== undefined ? { arguments: eventData.arguments } : {}),
           });
           return [
             {
@@ -1031,6 +1264,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           if (!toolCallId || !summary) {
             return [];
           }
+          entry.activeTurnHadToolActivity = true;
           const state = entry.toolCalls.get(toolCallId);
           return [
             {
@@ -1058,6 +1292,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           if (!toolCallId || !partialOutput) {
             return [];
           }
+          entry.activeTurnHadToolActivity = true;
           const state = entry.toolCalls.get(toolCallId);
           return [
             {
@@ -1086,6 +1321,7 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           if (!toolCallId) {
             return [];
           }
+          entry.activeTurnHadToolActivity = true;
           const state = entry.toolCalls.get(toolCallId);
           entry.toolCalls.delete(toolCallId);
           const detail = extractToolResultDetail(eventData);
@@ -1106,14 +1342,62 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 status: inferToolCompletionStatus(eventData.success),
                 ...(state?.title ? { title: state.title } : {}),
                 ...(detail ? { detail } : {}),
-                data: eventData,
+                data:
+                  state?.arguments !== undefined
+                    ? {
+                        ...eventData,
+                        arguments: state.arguments,
+                      }
+                    : eventData,
               },
             },
           ];
         }
         case "session.idle": {
-          touchSession(entry, { status: "ready" }, createdAt);
+          if (entry.activeTurnHadToolActivity && !entry.activeTurnHadCompletedAssistantMessage) {
+            scheduleToolOnlyTurnCompletion({
+              entry,
+              raw,
+              emitIdleState: true,
+            });
+            return [];
+          }
+          const activeTurnStillOpen = entry.activeTurnId !== undefined;
+          const cancelledEvents = activeTurnStillOpen
+            ? cancelPendingInteractiveRequests({
+                entry,
+                createdAt,
+                reason: "Copilot session became idle before the interactive request was resolved.",
+              })
+            : [];
+          const { turnId, providerTurnId } = activeTurnStillOpen
+            ? clearTurnState(entry, { status: "ready", lastError: undefined }, createdAt)
+            : { turnId: undefined, providerTurnId: undefined };
+          const usage = entry.lastUsage;
+          entry.lastUsage = undefined;
+          if (!activeTurnStillOpen) {
+            touchSession(entry, { status: "ready" }, createdAt);
+          }
           return [
+            ...cancelledEvents,
+            ...(turnId !== undefined
+              ? [
+                  {
+                    ...makeRuntimeEventBase({
+                      threadId: entry.threadId,
+                      createdAt,
+                      turnId,
+                      providerTurnId,
+                      raw,
+                    }),
+                    type: "turn.completed" as const,
+                    payload: {
+                      state: "completed" as const,
+                      ...(usage !== undefined ? { usage } : {}),
+                    },
+                  },
+                ]
+              : []),
             {
               ...makeRuntimeEventBase({
                 threadId: entry.threadId,
@@ -1187,14 +1471,23 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           if (!message) {
             return [];
           }
-          touchSession(entry, { status: "error", lastError: message }, createdAt);
+          const cancelledEvents = cancelPendingInteractiveRequests({
+            entry,
+            createdAt,
+            reason: message,
+          });
+          const { turnId, providerTurnId } = clearTurnState(
+            entry,
+            { status: "error", lastError: message },
+            createdAt,
+          );
           return [
             {
               ...makeRuntimeEventBase({
                 threadId: entry.threadId,
                 createdAt,
-                turnId: activeTurnId,
-                providerTurnId: activeProviderTurnId,
+                turnId,
+                providerTurnId,
                 raw,
               }),
               type: "runtime.error",
@@ -1204,12 +1497,31 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 detail: eventData,
               },
             },
+            ...cancelledEvents,
+            ...(turnId !== undefined
+              ? [
+                  {
+                    ...makeRuntimeEventBase({
+                      threadId: entry.threadId,
+                      createdAt,
+                      turnId,
+                      providerTurnId,
+                      raw,
+                    }),
+                    type: "turn.completed" as const,
+                    payload: {
+                      state: "failed" as const,
+                      errorMessage: message,
+                    },
+                  },
+                ]
+              : []),
             {
               ...makeRuntimeEventBase({
                 threadId: entry.threadId,
                 createdAt,
-                turnId: activeTurnId,
-                providerTurnId: activeProviderTurnId,
+                turnId,
+                providerTurnId,
                 raw,
               }),
               type: "session.state.changed",
@@ -1217,6 +1529,73 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 state: "error",
                 reason: message,
                 detail: eventData,
+              },
+            },
+          ];
+        }
+        case "session.shutdown": {
+          const shutdownType =
+            asTrimmedString(eventData.shutdownType) ??
+            asTrimmedString(eventData.type) ??
+            asTrimmedString(eventData.kind);
+          const exitKind = shutdownType === "routine" ? "graceful" : "error";
+          const reason =
+            asTrimmedString(eventData.message) ??
+            asTrimmedString(eventData.reason) ??
+            (exitKind === "graceful"
+              ? "Copilot session shut down."
+              : "Copilot session shut down unexpectedly.");
+          const cancelledEvents = cancelPendingInteractiveRequests({
+            entry,
+            createdAt,
+            reason,
+          });
+          const { turnId, providerTurnId } = clearTurnState(
+            entry,
+            {
+              status: exitKind === "error" ? "error" : "closed",
+              ...(exitKind === "error" ? { lastError: reason } : {}),
+            },
+            createdAt,
+          );
+          removeEntry(entry);
+          return [
+            ...cancelledEvents,
+            ...(turnId !== undefined
+              ? [
+                  {
+                    ...makeRuntimeEventBase({
+                      threadId: entry.threadId,
+                      createdAt,
+                      turnId,
+                      providerTurnId,
+                      raw,
+                    }),
+                    type: "turn.completed" as const,
+                    payload: exitKind === "error"
+                      ? {
+                          state: "failed" as const,
+                          errorMessage: reason,
+                        }
+                      : {
+                          state: "cancelled" as const,
+                        },
+                  },
+                ]
+              : []),
+            {
+              ...makeRuntimeEventBase({
+                threadId: entry.threadId,
+                createdAt,
+                turnId,
+                providerTurnId,
+                raw,
+              }),
+              type: "session.exited",
+              payload: {
+                reason,
+                exitKind,
+                ...(exitKind === "error" ? { recoverable: true } : {}),
               },
             },
           ];
@@ -1477,6 +1856,9 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                 lastPlanTurnId: undefined,
                 lastPlanMarkdown: undefined,
                 lastUsage: undefined,
+                activeTurnHadToolActivity: false,
+                activeTurnHadCompletedAssistantMessage: false,
+                pendingToolOnlyCompletionTimer: undefined,
               };
               entryRef = entry;
               if (existing) {
@@ -1678,7 +2060,12 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
                     turnId,
                   }),
                   type: "turn.started",
-                  payload: input.model !== undefined ? { model: input.model } : {},
+                  payload: {
+                    ...(input.model !== undefined ? { model: input.model } : {}),
+                    ...(input.assistantDeliveryMode !== undefined
+                      ? { assistantDeliveryMode: input.assistantDeliveryMode }
+                      : {}),
+                  },
                 },
               ]),
             ),
@@ -1738,18 +2125,22 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
           try: () => entry.session.abort(),
           catch: (cause) => toRequestError("session.abort", "Failed to interrupt Copilot turn.", cause),
         });
+        const createdAt = now();
+        const cancelledEvents = cancelPendingInteractiveRequests({
+          entry,
+          createdAt,
+          reason: "Copilot turn interrupted before the interactive request was resolved.",
+        });
         if (entry.activeTurnId !== undefined) {
-          const turnId = entry.activeTurnId;
-          entry.activeTurnId = undefined;
-          entry.activeProviderTurnId = undefined;
-          entry.toolCalls.clear();
-          touchSession(entry, { status: "ready", activeTurnId: undefined }, now());
+          const { turnId, providerTurnId } = clearTurnState(entry, { status: "ready" }, createdAt);
           yield* emitRuntimeEvents([
+            ...cancelledEvents,
             {
               ...makeRuntimeEventBase({
                 threadId,
-                createdAt: now(),
+                createdAt,
                 turnId,
+                providerTurnId,
               }),
               type: "turn.aborted",
               payload: {
@@ -1757,6 +2148,11 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
               },
             },
           ]);
+          return;
+        }
+
+        if (cancelledEvents.length > 0) {
+          yield* emitRuntimeEvents(cancelledEvents);
         }
       });
 
@@ -1823,6 +2219,14 @@ const makeCopilotAdapter = (options?: CopilotAdapterLiveOptions) =>
             provider: PROVIDER,
             operation: "respondToUserInput",
             issue: `No response was provided for Copilot user input request '${requestId}'.`,
+          });
+        }
+
+        if (!isChoiceAnswer(pending.request, answer) && !allowsFreeformAnswer(pending.request)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "respondToUserInput",
+            issue: `Copilot user input request '${requestId}' only accepts one of the provided choices.`,
           });
         }
 

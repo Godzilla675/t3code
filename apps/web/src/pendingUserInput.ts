@@ -19,6 +19,10 @@ export interface PendingUserInputProgress {
   canAdvance: boolean;
 }
 
+export function allowsPendingUserInputCustomAnswer(question: UserInputQuestion): boolean {
+  return question.allowFreeform !== false;
+}
+
 function normalizeDraftAnswer(value: string | undefined): string | null {
   if (typeof value !== "string") {
     return null;
@@ -29,10 +33,11 @@ function normalizeDraftAnswer(value: string | undefined): string | null {
 }
 
 export function resolvePendingUserInputAnswer(
+  question: UserInputQuestion,
   draft: PendingUserInputDraftAnswer | undefined,
 ): string | null {
   const customAnswer = normalizeDraftAnswer(draft?.customAnswer);
-  if (customAnswer) {
+  if (customAnswer && allowsPendingUserInputCustomAnswer(question)) {
     return customAnswer;
   }
 
@@ -40,9 +45,17 @@ export function resolvePendingUserInputAnswer(
 }
 
 export function setPendingUserInputCustomAnswer(
+  question: UserInputQuestion,
   draft: PendingUserInputDraftAnswer | undefined,
   customAnswer: string,
 ): PendingUserInputDraftAnswer {
+  if (!allowsPendingUserInputCustomAnswer(question)) {
+    return {
+      customAnswer: "",
+      ...(draft?.selectedOptionLabel ? { selectedOptionLabel: draft.selectedOptionLabel } : {}),
+    };
+  }
+
   const selectedOptionLabel =
     customAnswer.trim().length > 0 ? undefined : draft?.selectedOptionLabel;
 
@@ -59,7 +72,7 @@ export function buildPendingUserInputAnswers(
   const answers: Record<string, string> = {};
 
   for (const question of questions) {
-    const answer = resolvePendingUserInputAnswer(draftAnswers[question.id]);
+    const answer = resolvePendingUserInputAnswer(question, draftAnswers[question.id]);
     if (!answer) {
       return null;
     }
@@ -74,7 +87,7 @@ export function countAnsweredPendingUserInputQuestions(
   draftAnswers: Record<string, PendingUserInputDraftAnswer>,
 ): number {
   return questions.reduce((count, question) => {
-    return resolvePendingUserInputAnswer(draftAnswers[question.id]) ? count + 1 : count;
+    return resolvePendingUserInputAnswer(question, draftAnswers[question.id]) ? count + 1 : count;
   }, 0);
 }
 
@@ -83,7 +96,7 @@ export function findFirstUnansweredPendingUserInputQuestionIndex(
   draftAnswers: Record<string, PendingUserInputDraftAnswer>,
 ): number {
   const unansweredIndex = questions.findIndex(
-    (question) => !resolvePendingUserInputAnswer(draftAnswers[question.id]),
+    (question) => !resolvePendingUserInputAnswer(question, draftAnswers[question.id]),
   );
 
   return unansweredIndex === -1 ? Math.max(questions.length - 1, 0) : unansweredIndex;
@@ -100,7 +113,9 @@ export function derivePendingUserInputProgress(
       : Math.max(0, Math.min(questionIndex, questions.length - 1));
   const activeQuestion = questions[normalizedQuestionIndex] ?? null;
   const activeDraft = activeQuestion ? draftAnswers[activeQuestion.id] : undefined;
-  const resolvedAnswer = resolvePendingUserInputAnswer(activeDraft);
+  const resolvedAnswer = activeQuestion
+    ? resolvePendingUserInputAnswer(activeQuestion, activeDraft)
+    : null;
   const customAnswer = activeDraft?.customAnswer ?? "";
   const answeredQuestionCount = countAnsweredPendingUserInputQuestions(questions, draftAnswers);
   const isLastQuestion =

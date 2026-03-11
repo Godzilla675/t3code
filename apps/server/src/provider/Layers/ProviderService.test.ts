@@ -1114,6 +1114,104 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
     }),
   );
+
+  it.effect("persists Copilot session error and exit events into runtime state", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntimeRepository;
+
+      const session = yield* provider.startSession(asThreadId("thread-copilot-runtime"), {
+        provider: "copilot",
+        threadId: asThreadId("thread-copilot-runtime"),
+        runtimeMode: "full-access",
+      });
+      yield* provider.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+      });
+      yield* sleep(20);
+
+      routing.copilot.emit({
+        type: "request.opened",
+        eventId: asEventId("evt-copilot-request-opened"),
+        provider: "copilot",
+        createdAt: new Date().toISOString(),
+        threadId: session.threadId,
+        turnId: asTurnId(`turn-${String(session.threadId)}`),
+        requestId: asRequestId("req-copilot-runtime"),
+        payload: {
+          requestType: "command_execution_approval",
+        },
+      });
+      routing.copilot.emit({
+        type: "session.state.changed",
+        eventId: asEventId("evt-copilot-session-error"),
+        provider: "copilot",
+        createdAt: new Date().toISOString(),
+        threadId: session.threadId,
+        payload: {
+          state: "error",
+          reason: "Copilot crashed",
+        },
+      });
+      yield* sleep(20);
+
+      const erroredRuntime = yield* runtimeRepository.getByThreadId({
+        threadId: session.threadId,
+      });
+      assert.equal(Option.isSome(erroredRuntime), true);
+      if (Option.isSome(erroredRuntime)) {
+        assert.equal(erroredRuntime.value.status, "error");
+        const payload = erroredRuntime.value.runtimePayload;
+        assert.equal(payload !== null && typeof payload === "object" && !Array.isArray(payload), true);
+        if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+          const runtimePayload = payload as {
+            activeTurnId?: string | null;
+            lastError?: string | null;
+          };
+          assert.equal(runtimePayload.activeTurnId, null);
+          assert.equal(runtimePayload.lastError, "Copilot crashed");
+        }
+      }
+
+      routing.copilot.emit({
+        type: "session.exited",
+        eventId: asEventId("evt-copilot-session-exited"),
+        provider: "copilot",
+        createdAt: new Date().toISOString(),
+        threadId: session.threadId,
+        payload: {
+          reason: "Copilot crashed",
+          exitKind: "error",
+          recoverable: true,
+        },
+      });
+      yield* sleep(20);
+
+      const exitedRuntime = yield* runtimeRepository.getByThreadId({
+        threadId: session.threadId,
+      });
+      assert.equal(Option.isSome(exitedRuntime), true);
+      if (Option.isSome(exitedRuntime)) {
+        assert.equal(exitedRuntime.value.status, "error");
+        const payload = exitedRuntime.value.runtimePayload;
+        assert.equal(payload !== null && typeof payload === "object" && !Array.isArray(payload), true);
+        if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+          const runtimePayload = payload as {
+            activeTurnId?: string | null;
+            lastError?: string | null;
+            pendingApprovalRequests?: ReadonlyArray<unknown>;
+            pendingUserInputRequests?: ReadonlyArray<unknown>;
+          };
+          assert.equal(runtimePayload.activeTurnId, null);
+          assert.equal(runtimePayload.lastError, "Copilot crashed");
+          assert.deepEqual(runtimePayload.pendingApprovalRequests ?? [], []);
+          assert.deepEqual(runtimePayload.pendingUserInputRequests ?? [], []);
+        }
+      }
+    }),
+  );
 });
 
 const fanout = makeProviderServiceLayer();

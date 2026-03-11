@@ -91,6 +91,7 @@ describe("ProviderRuntimeEvent", () => {
                 description: "Allow unrestricted access",
               },
             ],
+            allowFreeform: false,
           },
         ],
       },
@@ -102,6 +103,7 @@ describe("ProviderRuntimeEvent", () => {
     }
     expect(parsed.payload.questions[0]?.id).toBe("sandbox_mode");
     expect(parsed.payload.questions[0]?.options).toHaveLength(2);
+    expect(parsed.payload.questions[0]?.allowFreeform).toBe(false);
   });
 
   it("decodes user-input.resolved with answer map", () => {

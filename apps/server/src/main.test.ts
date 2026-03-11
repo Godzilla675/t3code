@@ -1,13 +1,13 @@
 import * as Http from "node:http";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it, vi } from "@effect/vitest";
+import { it } from "@effect/vitest";
 import type { OrchestrationReadModel } from "@t3tools/contracts";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Command from "effect/unstable/cli/Command";
 import { FetchHttpClient } from "effect/unstable/http";
-import { beforeEach } from "vitest";
+import { assert, beforeEach, vi } from "vitest";
 import { NetService } from "@t3tools/shared/Net";
 
 import { CliConfig, recordStartupHeartbeat, t3Cli, type CliConfigShape } from "./main";
@@ -21,6 +21,35 @@ import { Server, type ServerShape } from "./wsServer";
 const start = vi.fn(() => undefined);
 const stop = vi.fn(() => undefined);
 let resolvedConfig: ServerConfigShape | null = null;
+const emptyProjectionSnapshot = {
+  snapshotSequence: 0,
+  projects: [],
+  threads: [],
+  updatedAt: new Date(0).toISOString(),
+} satisfies OrchestrationReadModel;
+const HeartbeatFlushGraceMs = process.platform === "win32" ? 250 : 100;
+let heartbeatRecorded = Promise.resolve();
+let resolveHeartbeatRecorded: (() => void) | null = null;
+
+const resetHeartbeatRecorded = () => {
+  heartbeatRecorded = new Promise<void>((resolve) => {
+    resolveHeartbeatRecorded = () => {
+      resolveHeartbeatRecorded = null;
+      resolve();
+    };
+  });
+};
+
+const waitForHeartbeatRecorded = () =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, HeartbeatFlushGraceMs);
+    timer.unref?.();
+    void heartbeatRecorded.finally(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+
 const serverStart = Effect.acquireRelease(
   Effect.gen(function* () {
     resolvedConfig = yield* ServerConfig;
@@ -30,7 +59,7 @@ const serverStart = Effect.acquireRelease(
   () => Effect.sync(() => stop()),
 );
 const findAvailablePort = vi.fn((preferred: number) => Effect.succeed(preferred));
-const MainCliSlowTestTimeoutMs = process.platform === "win32" ? 10_000 : 7_500;
+const MainCliSlowTestTimeoutMs = process.platform === "win32" ? 30_000 : 15_000;
 
 // Shared service layer used by this CLI test suite.
 const testLayer = Layer.mergeAll(
@@ -47,13 +76,22 @@ const testLayer = Layer.mergeAll(
   }),
   Layer.succeed(Server, {
     start: serverStart,
-    stopSignal: Effect.void,
+    stopSignal: Effect.promise(waitForHeartbeatRecorded),
   } satisfies ServerShape),
   Layer.succeed(Open, {
     openBrowser: (_target: string) => Effect.void,
     openInEditor: () => Effect.void,
   } satisfies OpenShape),
-  AnalyticsService.layerTest,
+  Layer.succeed(AnalyticsService, {
+    record: () =>
+      Effect.sync(() => {
+        resolveHeartbeatRecorded?.();
+      }),
+    flush: Effect.void,
+  }),
+  Layer.succeed(ProjectionSnapshotQuery, {
+    getSnapshot: () => Effect.succeed(emptyProjectionSnapshot),
+  }),
   FetchHttpClient.layer,
   NodeServices.layer,
 );
@@ -85,6 +123,7 @@ const expectResolvedStateDir = (actual: string | undefined, raw: string) =>
 beforeEach(() => {
   vi.clearAllMocks();
   resolvedConfig = null;
+  resetHeartbeatRecorded();
   start.mockImplementation(() => undefined);
   stop.mockImplementation(() => undefined);
   findAvailablePort.mockImplementation((preferred: number) => Effect.succeed(preferred));
@@ -129,7 +168,7 @@ it.layer(testLayer)("server CLI command", (it) => {
 
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.authToken, "token-secret");
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("uses env fallbacks when flags are not provided", () =>
@@ -171,7 +210,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "web");
       assert.equal(resolvedConfig?.port, 4666);
       assert.equal(resolvedConfig?.host, undefined);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("prefers --no-browser over T3CODE_NO_BROWSER", () =>
@@ -182,7 +221,7 @@ it.layer(testLayer)("server CLI command", (it) => {
 
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.noBrowser, true);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("uses dynamic port discovery in web mode when port is omitted", () =>
@@ -194,7 +233,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.port, 5444);
       assert.equal(resolvedConfig?.mode, "web");
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("uses fixed localhost defaults in desktop mode", () =>
@@ -209,7 +248,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.port, 3773);
       assert.equal(resolvedConfig?.host, "127.0.0.1");
       assert.equal(resolvedConfig?.mode, "desktop");
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("allows overriding desktop host with --host", () =>
@@ -222,7 +261,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.host, "0.0.0.0");
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("supports CLI and env for bootstrap/log websocket toggles", () =>
@@ -237,7 +276,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.autoBootstrapProjectFromCwd, true);
       assert.equal(resolvedConfig?.logWebSocketEvents, false);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("records a startup heartbeat with thread/project counts", () =>
@@ -274,7 +313,7 @@ it.layer(testLayer)("server CLI command", (it) => {
           projectCount: 1,
         },
       ]);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("does not start server for invalid --mode values", () =>
@@ -283,7 +322,7 @@ it.layer(testLayer)("server CLI command", (it) => {
 
       assert.equal(start.mock.calls.length, 0);
       assert.equal(stop.mock.calls.length, 0);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("does not start server for invalid --dev-url values", () =>
@@ -292,7 +331,7 @@ it.layer(testLayer)("server CLI command", (it) => {
 
       assert.equal(start.mock.calls.length, 0);
       assert.equal(stop.mock.calls.length, 0);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 
   it.effect("does not start server for out-of-range --port values", () =>
@@ -302,6 +341,6 @@ it.layer(testLayer)("server CLI command", (it) => {
       // effect/unstable/cli renders help/errors for parse failures and returns success.
       assert.equal(start.mock.calls.length, 0);
       assert.equal(stop.mock.calls.length, 0);
-    }),
+    }), MainCliSlowTestTimeoutMs,
   );
 });

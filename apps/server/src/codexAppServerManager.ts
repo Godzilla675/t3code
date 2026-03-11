@@ -27,6 +27,7 @@ import {
   isCodexCliVersionSupported,
   parseCodexCliVersion,
 } from "./provider/codexCliVersion";
+import { getCodexCliLaunchSpec } from "./provider/codexCliCommand";
 
 type PendingRequestKey = string;
 
@@ -144,7 +145,7 @@ export interface CodexThreadSnapshot {
   turns: CodexThreadTurnSnapshot[];
 }
 
-const CODEX_VERSION_CHECK_TIMEOUT_MS = 4_000;
+const CODEX_VERSION_CHECK_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 4_000;
 
 const ANSI_ESCAPE_CHAR = String.fromCharCode(27);
 const ANSI_ESCAPE_REGEX = new RegExp(`${ANSI_ESCAPE_CHAR}\\[[0-9;]*m`, "g");
@@ -548,14 +549,19 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         cwd: resolvedCwd,
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
       });
-      const child = spawn(codexBinaryPath, ["app-server"], {
+      const launch = getCodexCliLaunchSpec({
+        binaryPath: codexBinaryPath,
+        args: ["app-server"],
+      });
+      const child = spawn(launch.command, [...launch.args], {
         cwd: resolvedCwd,
         env: {
           ...process.env,
+          ...(launch.extraEnv ?? {}),
           ...(codexHomePath ? { CODEX_HOME: codexHomePath } : {}),
         },
         stdio: ["pipe", "pipe", "pipe"],
-        shell: process.platform === "win32",
+        shell: launch.shell,
       });
       const output = readline.createInterface({ input: child.stdout });
 
@@ -1526,14 +1532,19 @@ function assertSupportedCodexCliVersion(input: {
   readonly cwd: string;
   readonly homePath?: string;
 }): void {
-  const result = spawnSync(input.binaryPath, ["--version"], {
+  const launch = getCodexCliLaunchSpec({
+    binaryPath: input.binaryPath,
+    args: ["--version"],
+  });
+  const result = spawnSync(launch.command, [...launch.args], {
     cwd: input.cwd,
     env: {
       ...process.env,
+      ...(launch.extraEnv ?? {}),
       ...(input.homePath ? { CODEX_HOME: input.homePath } : {}),
     },
     encoding: "utf8",
-    shell: process.platform === "win32",
+    shell: launch.shell,
     stdio: ["ignore", "pipe", "pipe"],
     timeout: CODEX_VERSION_CHECK_TIMEOUT_MS,
     maxBuffer: 1024 * 1024,

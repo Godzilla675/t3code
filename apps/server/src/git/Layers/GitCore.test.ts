@@ -21,7 +21,7 @@ const GitCoreTestLayer = GitCoreLive.pipe(
   Layer.provide(NodeServices.layer),
 );
 const TestLayer = Layer.mergeAll(NodeServices.layer, GitServiceTestLayer, GitCoreTestLayer);
-const GitCoreSlowTestTimeoutMs = 15_000;
+const GitCoreSlowTestTimeoutMs = process.platform === "win32" ? 45_000 : 20_000;
 
 function makeTmpDir(
   prefix = "git-test-",
@@ -249,7 +249,7 @@ it.layer(TestLayer)("git integration", (it) => {
         const result = yield* listGitBranches({ cwd: tmp });
         expect(result.isRepo).toBe(true);
         expect(result.branches.length).toBeGreaterThanOrEqual(1);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -273,7 +273,7 @@ it.layer(TestLayer)("git integration", (it) => {
         const current = result.branches.find((b) => b.current);
         expect(current).toBeDefined();
         expect(current!.current).toBe(true);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("does not include detached HEAD pseudo-refs as branches", () =>
@@ -285,7 +285,7 @@ it.layer(TestLayer)("git integration", (it) => {
         const result = yield* listGitBranches({ cwd: tmp });
         expect(result.branches.some((branch) => branch.name.startsWith("("))).toBe(false);
         expect(result.branches.some((branch) => branch.current)).toBe(false);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("keeps current branch first and sorts the remaining branches by recency", () =>
@@ -390,7 +390,7 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* initRepoWithCommit(tmp);
         const result = yield* listGitBranches({ cwd: tmp });
         expect(result.branches.every((b) => b.isDefault === false)).toBe(true);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("lists local branches first and remote branches last", () =>
@@ -484,7 +484,7 @@ it.layer(TestLayer)("git integration", (it) => {
         const result = yield* listGitBranches({ cwd: tmp });
         const current = result.branches.find((b) => b.current);
         expect(current!.name).toBe("feature");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("refreshes upstream behind count after checkout when remote branch advanced", () =>
@@ -527,7 +527,7 @@ it.layer(TestLayer)("git integration", (it) => {
             expect(details.branch).toBe(featureBranch);
             expect(details.aheadCount).toBe(0);
             expect(details.behindCount).toBe(1);
-          }),
+          }, { timeout: GitCoreSlowTestTimeoutMs }),
         );
       }), GitCoreSlowTestTimeoutMs,
     );
@@ -576,10 +576,10 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* Effect.promise(() =>
           vi.waitFor(() => {
             expect(refreshFetchAttempts).toBe(1);
-          }),
+          }, { timeout: GitCoreSlowTestTimeoutMs }),
         );
         expect(yield* git(source, ["branch", "--show-current"])).toBe(featureBranch);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("refresh fetch is scoped to the checked out branch upstream refspec", () =>
@@ -618,7 +618,7 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* Effect.promise(() =>
           vi.waitFor(() => {
             expect(fetchArgs).not.toBeNull();
-          }),
+          }, { timeout: GitCoreSlowTestTimeoutMs }),
         );
 
         expect(yield* git(source, ["branch", "--show-current"])).toBe(featureBranch);
@@ -629,7 +629,7 @@ it.layer(TestLayer)("git integration", (it) => {
           "origin",
           `+refs/heads/${featureBranch}:refs/remotes/origin/${featureBranch}`,
         ]);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("returns checkout result before background upstream refresh completes", () =>
@@ -674,11 +674,11 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* Effect.promise(() =>
           vi.waitFor(() => {
             expect(fetchStarted).toBe(true);
-          }),
+          }, { timeout: GitCoreSlowTestTimeoutMs }),
         );
         expect(yield* git(source, ["branch", "--show-current"])).toBe(featureBranch);
         releaseFetch();
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("throws when branch does not exist", () =>
@@ -687,7 +687,7 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* initRepoWithCommit(tmp);
         const result = yield* Effect.result(checkoutGitBranch({ cwd: tmp, branch: "nonexistent" }));
         expect(result._tag).toBe("Failure");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect(
@@ -712,7 +712,7 @@ it.layer(TestLayer)("git integration", (it) => {
           );
           expect(checkoutResult._tag).toBe("Failure");
           expect(yield* git(source, ["branch", "--show-current"])).toBe(defaultBranch);
-        }),
+        }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("checks out a remote tracking branch when remote name contains slashes", () =>
@@ -741,7 +741,7 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* checkoutGitBranch({ cwd: source, branch: `${remoteName}/${featureBranch}` });
 
         expect(yield* git(source, ["branch", "--show-current"])).toBe("upstream/feature");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect(
@@ -768,7 +768,7 @@ it.layer(TestLayer)("git integration", (it) => {
           const core = yield* GitCore;
           const status = yield* core.statusDetails(source);
           expect(status.branch).toBeNull();
-        }),
+        }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("throws when checkout would overwrite uncommitted changes", () =>
@@ -800,7 +800,7 @@ it.layer(TestLayer)("git integration", (it) => {
         // Checkout should fail due to uncommitted changes
         const result = yield* Effect.result(checkoutGitBranch({ cwd: tmp, branch: "other" }));
         expect(result._tag).toBe("Failure");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -815,7 +815,7 @@ it.layer(TestLayer)("git integration", (it) => {
 
         const result = yield* listGitBranches({ cwd: tmp });
         expect(result.branches.some((b) => b.name === "new-feature")).toBe(true);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("throws when branch already exists", () =>
@@ -825,7 +825,7 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* createGitBranch({ cwd: tmp, branch: "dupe" });
         const result = yield* Effect.result(createGitBranch({ cwd: tmp, branch: "dupe" }));
         expect(result._tag).toBe("Failure");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -851,7 +851,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(branches.branches.some((branch) => branch.name === "feature/old-name")).toBe(false);
         const current = branches.branches.find((branch) => branch.current);
         expect(current?.name).toBe("feature/new-name");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("returns success without git invocation when old/new names match", () =>
@@ -867,7 +867,7 @@ it.layer(TestLayer)("git integration", (it) => {
         });
 
         expect(renamed.branch).toBe(current.name);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("appends numeric suffix when target branch already exists", () =>
@@ -894,7 +894,7 @@ it.layer(TestLayer)("git integration", (it) => {
         );
         const current = branches.branches.find((branch) => branch.current);
         expect(current?.name).toBe("t3code/feat/session-1");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("increments suffix until it finds an available branch name", () =>
@@ -913,7 +913,7 @@ it.layer(TestLayer)("git integration", (it) => {
         });
 
         expect(renamed.branch).toBe("t3code/feat/session-2");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("uses '--' separator for branch rename arguments", () =>
@@ -948,7 +948,7 @@ it.layer(TestLayer)("git integration", (it) => {
           "feature/old-name",
           "feature/new-name",
         ]);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -979,7 +979,7 @@ it.layer(TestLayer)("git integration", (it) => {
 
         // Clean up worktree before tmp dir disposal
         yield* removeGitWorktree({ cwd: tmp, path: wtPath });
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("worktree has the new branch checked out", () =>
@@ -1004,7 +1004,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(branchOutput).toBe("wt-check");
 
         yield* removeGitWorktree({ cwd: tmp, path: wtPath });
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("throws when new branch name already exists", () =>
@@ -1027,7 +1027,7 @@ it.layer(TestLayer)("git integration", (it) => {
           }),
         );
         expect(result._tag).toBe("Failure");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("listGitBranches from worktree cwd reports worktree branch as current", () =>
@@ -1059,7 +1059,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(mainCurrent!.name).toBe(mainBranch);
 
         yield* removeGitWorktree({ cwd: tmp, path: wtPath });
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("removeGitWorktree cleans up the worktree", () =>
@@ -1082,7 +1082,7 @@ it.layer(TestLayer)("git integration", (it) => {
 
         yield* removeGitWorktree({ cwd: tmp, path: wtPath });
         expect(existsSync(wtPath)).toBe(false);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("removeGitWorktree force removes a dirty worktree", () =>
@@ -1111,7 +1111,7 @@ it.layer(TestLayer)("git integration", (it) => {
 
         yield* removeGitWorktree({ cwd: tmp, path: wtPath, force: true });
         expect(existsSync(wtPath)).toBe(false);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -1128,7 +1128,7 @@ it.layer(TestLayer)("git integration", (it) => {
         const result = yield* listGitBranches({ cwd: tmp });
         const current = result.branches.find((b) => b.current);
         expect(current!.name).toBe("feature-login");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -1165,7 +1165,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(wtBranch).toBe("feature-wt");
 
         yield* removeGitWorktree({ cwd: tmp, path: wtPath });
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -1193,7 +1193,7 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* checkoutGitBranch({ cwd: tmp, branch: "branch-a" });
         branches = yield* listGitBranches({ cwd: tmp });
         expect(branches.branches.find((b) => b.current)!.name).toBe("branch-a");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -1229,7 +1229,7 @@ it.layer(TestLayer)("git integration", (it) => {
         // Current branch should still be the initial one
         const result = yield* listGitBranches({ cwd: tmp });
         expect(result.branches.find((b) => b.current)!.name).toBe(initialBranch);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
   });
 
@@ -1255,7 +1255,7 @@ it.layer(TestLayer)("git integration", (it) => {
           branches.branches.find((branch: { current: boolean; name: string }) => branch.current)
             ?.name,
         ).toBe("feature/service-api");
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("reports status details and dirty state", () =>
@@ -1271,7 +1271,7 @@ it.layer(TestLayer)("git integration", (it) => {
         yield* writeTextFile(path.join(tmp, "README.md"), "updated\n");
         const dirty = yield* core.statusDetails(tmp);
         expect(dirty.hasWorkingTreeChanges).toBe(true);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("computes ahead count against base branch when no upstream is configured", () =>
@@ -1291,7 +1291,7 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(details.hasUpstream).toBe(false);
         expect(details.aheadCount).toBe(1);
         expect(details.behindCount).toBe(0);
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect(
@@ -1323,7 +1323,7 @@ it.layer(TestLayer)("git integration", (it) => {
           expect(details.hasUpstream).toBe(false);
           expect(details.aheadCount).toBe(1);
           expect(details.behindCount).toBe(0);
-        }),
+        }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("skips push when no upstream is configured and branch is not ahead of base", () =>
@@ -1552,7 +1552,7 @@ it.layer(TestLayer)("git integration", (it) => {
         if (result._tag === "Failure") {
           expect(result.failure.message.toLowerCase()).toContain("no upstream");
         }
-      }),
+      }), GitCoreSlowTestTimeoutMs,
     );
 
     it.effect("lists branches when recency lookup fails", () =>

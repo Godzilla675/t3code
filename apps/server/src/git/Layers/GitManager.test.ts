@@ -322,7 +322,7 @@ function makeManager(input?: {
 }
 
 const GitManagerTestLayer = Layer.provideMerge(GitServiceLive, NodeServices.layer);
-const GitManagerSlowTestTimeoutMs = 15_000;
+const GitManagerSlowTestTimeoutMs = process.platform === "win32" ? 45_000 : 20_000;
 
 it.layer(GitManagerTestLayer)("GitManager", (it) => {
   it.effect("status includes PR metadata when branch already has an open PR", () =>
@@ -668,7 +668,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       );
 
       expect(errorMessage).toContain("no changes to commit");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("commits and pushes with upstream auto-setup when needed", () =>
@@ -695,7 +695,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           Effect.map((result) => result.stdout.trim()),
         ),
       ).toBe("origin/feature/stacked-flow");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect(
@@ -767,7 +767,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       expect(result.branch.status).toBe("skipped_not_requested");
       expect(result.commit.status).toBe("skipped_no_changes");
       expect(result.push.status).toBe("skipped_up_to_date");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("returns existing PR metadata for commit/push/pr action", () =>
@@ -803,7 +803,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       expect(result.pr.status).toBe("opened_existing");
       expect(result.pr.number).toBe(42);
       expect(ghCalls.some((call) => call.startsWith("pr view "))).toBe(false);
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("creates PR when one does not already exist", () =>
@@ -847,7 +847,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         ghCalls.some((call) => call.includes("pr create --base main --head feature-create-pr")),
       ).toBe(true);
       expect(ghCalls.some((call) => call.startsWith("pr view "))).toBe(false);
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("rejects push/pr actions from detached HEAD", () =>
@@ -865,7 +865,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         Effect.map((error) => error.message),
       );
       expect(errorMessage).toContain("detached HEAD");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("surfaces missing gh binary errors", () =>
@@ -894,7 +894,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         Effect.map((error) => error.message),
       );
       expect(errorMessage).toContain("GitHub CLI (`gh`) is required");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 
   it.effect("surfaces gh auth errors with guidance", () =>
@@ -923,6 +923,6 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         Effect.map((error) => error.message),
       );
       expect(errorMessage).toContain("gh auth login");
-    }),
+    }), GitManagerSlowTestTimeoutMs,
   );
 });

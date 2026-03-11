@@ -33,7 +33,9 @@ const THREAD_ID = ThreadId.makeUnsafe("thread-1");
 const FIXTURE_TURN_ID = "fixture-turn";
 const APPROVAL_REQUEST_ID = asApprovalRequestId("req-approval-1");
 type IntegrationProvider = "codex";
-const OrchestrationIntegrationSlowTestTimeoutMs = process.platform === "win32" ? 15_000 : 10_000;
+const OrchestrationIntegrationAsyncTimeoutMs = process.platform === "win32" ? 8_000 : 3_000;
+const OrchestrationIntegrationPollIntervalMs = process.platform === "win32" ? 25 : 10;
+const OrchestrationIntegrationSlowTestTimeoutMs = process.platform === "win32" ? 30_000 : 10_000;
 
 function normalizeLineEndings(value: string): string {
   return value.replace(/\r\n/g, "\n");
@@ -56,7 +58,7 @@ function waitForSync<A>(
   read: () => A,
   predicate: (value: A) => boolean,
   description: string,
-  timeoutMs = 3000,
+  timeoutMs = OrchestrationIntegrationAsyncTimeoutMs,
 ): Effect.Effect<A, never> {
   return Effect.gen(function* () {
     const deadline = Date.now() + timeoutMs;
@@ -69,7 +71,7 @@ function waitForSync<A>(
       if (Date.now() >= deadline) {
         return yield* Effect.die(new IntegrationWaitTimeoutError({ description }));
       }
-      yield* sleep(10);
+      yield* sleep(OrchestrationIntegrationPollIntervalMs);
     }
   });
 }

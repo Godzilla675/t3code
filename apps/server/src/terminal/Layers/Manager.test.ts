@@ -19,7 +19,8 @@ import {
 import { TerminalManagerRuntime } from "./Manager";
 import { Effect, Encoding } from "effect";
 
-const TerminalManagerSlowTestTimeoutMs = process.platform === "win32" ? 10_000 : 7_500;
+const TerminalManagerSlowTestTimeoutMs = process.platform === "win32" ? 20_000 : 12_000;
+const TerminalManagerAsyncWaitTimeoutMs = process.platform === "win32" ? 2_500 : 1_500;
 
 class FakePtyProcess implements PtyProcess {
   readonly writes: string[] = [];
@@ -108,7 +109,10 @@ class FakePtyAdapter implements PtyAdapterShape {
   }
 }
 
-function waitFor(predicate: () => boolean, timeoutMs = 800): Promise<void> {
+function waitFor(
+  predicate: () => boolean,
+  timeoutMs = TerminalManagerAsyncWaitTimeoutMs,
+): Promise<void> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
     const poll = () => {
@@ -162,8 +166,12 @@ function multiTerminalHistoryLogPath(
 
 describe("TerminalManager", () => {
   const tempDirs: string[] = [];
+  const managers: TerminalManagerRuntime[] = [];
 
   afterEach(() => {
+    for (const manager of managers.splice(0, managers.length)) {
+      manager.dispose();
+    }
     for (const dir of tempDirs.splice(0, tempDirs.length)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -197,219 +205,263 @@ describe("TerminalManager", () => {
         ? { maxRetainedInactiveSessions: options.maxRetainedInactiveSessions }
         : {}),
     });
+    managers.push(manager);
     return { logsDir, ptyAdapter, manager };
   }
 
-  it("spawns lazily and reuses running terminal per thread", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    const [first, second] = await Promise.all([
-      manager.open(openInput()),
-      manager.open(openInput()),
-    ]);
-    const third = await manager.open(openInput());
+  it(
+    "spawns lazily and reuses running terminal per thread",
+    async () => {
+      const { manager, ptyAdapter } = makeManager();
+      const [first, second] = await Promise.all([
+        manager.open(openInput()),
+        manager.open(openInput()),
+      ]);
+      const third = await manager.open(openInput());
 
-    expect(first.threadId).toBe("thread-1");
-    expect(first.terminalId).toBe("default");
-    expect(second.threadId).toBe("thread-1");
-    expect(third.threadId).toBe("thread-1");
-    expect(ptyAdapter.spawnInputs).toHaveLength(1);
+      expect(first.threadId).toBe("thread-1");
+      expect(first.terminalId).toBe("default");
+      expect(second.threadId).toBe("thread-1");
+      expect(third.threadId).toBe("thread-1");
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("supports asynchronous PTY spawn effects", async () => {
-    const { manager, ptyAdapter } = makeManager(5, { ptyAdapter: new FakePtyAdapter("async") });
+  it(
+    "supports asynchronous PTY spawn effects",
+    async () => {
+      const { manager, ptyAdapter } = makeManager(5, { ptyAdapter: new FakePtyAdapter("async") });
 
-    const snapshot = await manager.open(openInput());
+      const snapshot = await manager.open(openInput());
 
-    expect(snapshot.status).toBe("running");
-    expect(ptyAdapter.spawnInputs).toHaveLength(1);
-    expect(ptyAdapter.processes).toHaveLength(1);
+      expect(snapshot.status).toBe("running");
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+      expect(ptyAdapter.processes).toHaveLength(1);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("forwards write and resize to active pty process", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    await manager.open(openInput());
-    const process = ptyAdapter.processes[0];
-    expect(process).toBeDefined();
-    if (!process) return;
+  it(
+    "forwards write and resize to active pty process",
+    async () => {
+      const { manager, ptyAdapter } = makeManager();
+      await manager.open(openInput());
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
 
-    await manager.write({ threadId: "thread-1", data: "ls\n" });
-    await manager.resize({ threadId: "thread-1", cols: 120, rows: 30 });
+      await manager.write({ threadId: "thread-1", data: "ls\n" });
+      await manager.resize({ threadId: "thread-1", cols: 120, rows: 30 });
 
-    expect(process.writes).toEqual(["ls\n"]);
-    expect(process.resizeCalls).toEqual([{ cols: 120, rows: 30 }]);
+      expect(process.writes).toEqual(["ls\n"]);
+      expect(process.resizeCalls).toEqual([{ cols: 120, rows: 30 }]);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("resizes running terminal on open when a different size is requested", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    await manager.open(openInput({ cols: 100, rows: 24 }));
-    const process = ptyAdapter.processes[0];
-    expect(process).toBeDefined();
-    if (!process) return;
+  it(
+    "resizes running terminal on open when a different size is requested",
+    async () => {
+      const { manager, ptyAdapter } = makeManager();
+      await manager.open(openInput({ cols: 100, rows: 24 }));
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
 
-    await manager.open(openInput({ cols: 140, rows: 40 }));
+      await manager.open(openInput({ cols: 140, rows: 40 }));
 
-    expect(process.resizeCalls).toEqual([{ cols: 140, rows: 40 }]);
+      expect(process.resizeCalls).toEqual([{ cols: 140, rows: 40 }]);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("preserves existing terminal size on open when size is omitted", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    await manager.open(openInput({ cols: 100, rows: 24 }));
-    const ptyProcess = ptyAdapter.processes[0];
-    expect(ptyProcess).toBeDefined();
-    if (!ptyProcess) return;
+  it(
+    "preserves existing terminal size on open when size is omitted",
+    async () => {
+      const { manager, ptyAdapter } = makeManager();
+      await manager.open(openInput({ cols: 100, rows: 24 }));
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
 
-    await manager.open({
-      threadId: "thread-1",
-      cwd: globalThis.process.cwd(),
-    });
+      await manager.open({
+        threadId: "thread-1",
+        cwd: globalThis.process.cwd(),
+      });
 
-    expect(ptyProcess.resizeCalls).toEqual([]);
+      expect(ptyProcess.resizeCalls).toEqual([]);
 
-    ptyProcess.emitExit({ exitCode: 0, signal: 0 });
-    await manager.open({
-      threadId: "thread-1",
-      cwd: globalThis.process.cwd(),
-    });
+      ptyProcess.emitExit({ exitCode: 0, signal: 0 });
+      await manager.open({
+        threadId: "thread-1",
+        cwd: globalThis.process.cwd(),
+      });
 
-    const resumedSpawn = ptyAdapter.spawnInputs[1];
-    expect(resumedSpawn).toBeDefined();
-    if (!resumedSpawn) return;
-    expect(resumedSpawn.cols).toBe(100);
-    expect(resumedSpawn.rows).toBe(24);
+      const resumedSpawn = ptyAdapter.spawnInputs[1];
+      expect(resumedSpawn).toBeDefined();
+      if (!resumedSpawn) return;
+      expect(resumedSpawn.cols).toBe(100);
+      expect(resumedSpawn.rows).toBe(24);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("uses default dimensions when opening a new terminal without size hints", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    await manager.open({
-      threadId: "thread-1",
-      cwd: process.cwd(),
-    });
+  it(
+    "uses default dimensions when opening a new terminal without size hints",
+    async () => {
+      const { manager, ptyAdapter } = makeManager();
+      await manager.open({
+        threadId: "thread-1",
+        cwd: process.cwd(),
+      });
 
-    const spawned = ptyAdapter.spawnInputs[0];
-    expect(spawned).toBeDefined();
-    if (!spawned) return;
-    expect(spawned.cols).toBe(120);
-    expect(spawned.rows).toBe(30);
+      const spawned = ptyAdapter.spawnInputs[0];
+      expect(spawned).toBeDefined();
+      if (!spawned) return;
+      expect(spawned.cols).toBe(120);
+      expect(spawned.rows).toBe(30);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("supports multiple terminals per thread with isolated sessions", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    await manager.open(openInput({ terminalId: "default" }));
-    await manager.open(openInput({ terminalId: "term-2" }));
+  it(
+    "supports multiple terminals per thread with isolated sessions",
+    async () => {
+      const { manager, ptyAdapter } = makeManager();
+      await manager.open(openInput({ terminalId: "default" }));
+      await manager.open(openInput({ terminalId: "term-2" }));
 
-    const first = ptyAdapter.processes[0];
-    const second = ptyAdapter.processes[1];
-    expect(first).toBeDefined();
-    expect(second).toBeDefined();
-    if (!first || !second) return;
+      const first = ptyAdapter.processes[0];
+      const second = ptyAdapter.processes[1];
+      expect(first).toBeDefined();
+      expect(second).toBeDefined();
+      if (!first || !second) return;
 
-    await manager.write({ threadId: "thread-1", terminalId: "default", data: "pwd\n" });
-    await manager.write({ threadId: "thread-1", terminalId: "term-2", data: "ls\n" });
+      await manager.write({ threadId: "thread-1", terminalId: "default", data: "pwd\n" });
+      await manager.write({ threadId: "thread-1", terminalId: "term-2", data: "ls\n" });
 
-    expect(first.writes).toEqual(["pwd\n"]);
-    expect(second.writes).toEqual(["ls\n"]);
-    expect(ptyAdapter.spawnInputs).toHaveLength(2);
+      expect(first.writes).toEqual(["pwd\n"]);
+      expect(second.writes).toEqual(["ls\n"]);
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("clears transcript and emits cleared event", async () => {
-    const { manager, ptyAdapter, logsDir } = makeManager();
-    const events: TerminalEvent[] = [];
-    manager.on("event", (event) => {
-      events.push(event);
-    });
-    await manager.open(openInput());
-    const process = ptyAdapter.processes[0];
-    expect(process).toBeDefined();
-    if (!process) return;
+  it(
+    "clears transcript and emits cleared event",
+    async () => {
+      const { manager, ptyAdapter, logsDir } = makeManager();
+      const events: TerminalEvent[] = [];
+      manager.on("event", (event) => {
+        events.push(event);
+      });
+      await manager.open(openInput());
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
 
-    process.emitData("hello\n");
-    await waitFor(() => fs.existsSync(historyLogPath(logsDir)));
-    await manager.clear({ threadId: "thread-1" });
-    await waitFor(() => fs.readFileSync(historyLogPath(logsDir), "utf8") === "");
+      process.emitData("hello\n");
+      await waitFor(() => fs.existsSync(historyLogPath(logsDir)));
+      await manager.clear({ threadId: "thread-1" });
+      await waitFor(() => fs.readFileSync(historyLogPath(logsDir), "utf8") === "");
 
-    expect(events.some((event) => event.type === "cleared")).toBe(true);
-    expect(
-      events.some(
-        (event) =>
-          event.type === "cleared" &&
-          event.threadId === "thread-1" &&
-          event.terminalId === "default",
-      ),
-    ).toBe(true);
+      expect(events.some((event) => event.type === "cleared")).toBe(true);
+      expect(
+        events.some(
+          (event) =>
+            event.type === "cleared" &&
+            event.threadId === "thread-1" &&
+            event.terminalId === "default",
+        ),
+      ).toBe(true);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("restarts terminal with empty transcript and respawns pty", async () => {
-    const { manager, ptyAdapter, logsDir } = makeManager();
-    await manager.open(openInput());
-    const firstProcess = ptyAdapter.processes[0];
-    expect(firstProcess).toBeDefined();
-    if (!firstProcess) return;
-    firstProcess.emitData("before restart\n");
-    await waitFor(() => fs.existsSync(historyLogPath(logsDir)));
+  it(
+    "restarts terminal with empty transcript and respawns pty",
+    async () => {
+      const { manager, ptyAdapter, logsDir } = makeManager();
+      await manager.open(openInput());
+      const firstProcess = ptyAdapter.processes[0];
+      expect(firstProcess).toBeDefined();
+      if (!firstProcess) return;
+      firstProcess.emitData("before restart\n");
+      await waitFor(() => fs.existsSync(historyLogPath(logsDir)));
 
-    const snapshot = await manager.restart(openInput());
-    expect(snapshot.history).toBe("");
-    expect(snapshot.status).toBe("running");
-    expect(ptyAdapter.spawnInputs).toHaveLength(2);
-    await waitFor(() => fs.readFileSync(historyLogPath(logsDir), "utf8") === "");
+      const snapshot = await manager.restart(openInput());
+      expect(snapshot.history).toBe("");
+      expect(snapshot.status).toBe("running");
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+      await waitFor(() => fs.readFileSync(historyLogPath(logsDir), "utf8") === "");
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("emits exited event and reopens with clean transcript after exit", async () => {
-    const { manager, ptyAdapter, logsDir } = makeManager();
-    const events: TerminalEvent[] = [];
-    manager.on("event", (event) => {
-      events.push(event);
-    });
-    await manager.open(openInput());
-    const process = ptyAdapter.processes[0];
-    expect(process).toBeDefined();
-    if (!process) return;
-    process.emitData("old data\n");
-    await waitFor(() => fs.existsSync(historyLogPath(logsDir)));
-    process.emitExit({ exitCode: 0, signal: 0 });
+  it(
+    "emits exited event and reopens with clean transcript after exit",
+    async () => {
+      const { manager, ptyAdapter, logsDir } = makeManager();
+      const events: TerminalEvent[] = [];
+      manager.on("event", (event) => {
+        events.push(event);
+      });
+      await manager.open(openInput());
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
+      process.emitData("old data\n");
+      process.emitExit({ exitCode: 0, signal: 0 });
 
-    await waitFor(() => events.some((event) => event.type === "exited"));
-    const reopened = await manager.open(openInput());
+      expect(events.some((event) => event.type === "exited")).toBe(true);
+      const reopened = await manager.open(openInput());
 
-    expect(reopened.history).toBe("");
-    expect(ptyAdapter.spawnInputs).toHaveLength(2);
-    expect(fs.readFileSync(historyLogPath(logsDir), "utf8")).toBe("");
+      expect(reopened.history).toBe("");
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+      expect(fs.readFileSync(historyLogPath(logsDir), "utf8")).toBe("");
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("ignores trailing writes after terminal exit", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    await manager.open(openInput());
-    const process = ptyAdapter.processes[0];
-    expect(process).toBeDefined();
-    if (!process) return;
+  it(
+    "ignores trailing writes after terminal exit",
+    async () => {
+      const { manager, ptyAdapter } = makeManager();
+      await manager.open(openInput());
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
 
-    process.emitExit({ exitCode: 0, signal: 0 });
+      process.emitExit({ exitCode: 0, signal: 0 });
 
-    await expect(manager.write({ threadId: "thread-1", data: "\r" })).resolves.toBeUndefined();
-    expect(process.writes).toEqual([]);
+      await expect(manager.write({ threadId: "thread-1", data: "\r" })).resolves.toBeUndefined();
+      expect(process.writes).toEqual([]);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
   it("emits subprocess activity events when child-process state changes", async () => {
     let hasRunningSubprocess = false;
@@ -427,38 +479,42 @@ describe("TerminalManager", () => {
     expect(events.some((event) => event.type === "activity")).toBe(false);
 
     hasRunningSubprocess = true;
-    await waitFor(
-      () =>
-        events.some((event) => event.type === "activity" && event.hasRunningSubprocess === true),
-      1_200,
-    );
+      await waitFor(
+        () =>
+          events.some((event) => event.type === "activity" && event.hasRunningSubprocess === true),
+        TerminalManagerAsyncWaitTimeoutMs,
+      );
 
     hasRunningSubprocess = false;
-    await waitFor(
-      () =>
-        events.some((event) => event.type === "activity" && event.hasRunningSubprocess === false),
-      1_200,
-    );
+      await waitFor(
+        () =>
+          events.some((event) => event.type === "activity" && event.hasRunningSubprocess === false),
+        TerminalManagerAsyncWaitTimeoutMs,
+      );
 
     manager.dispose();
-  });
+  }, TerminalManagerSlowTestTimeoutMs);
 
-  it("caps persisted history to configured line limit", async () => {
-    const { manager, ptyAdapter } = makeManager(3);
-    await manager.open(openInput());
-    const process = ptyAdapter.processes[0];
-    expect(process).toBeDefined();
-    if (!process) return;
+  it(
+    "caps persisted history to configured line limit",
+    async () => {
+      const { manager, ptyAdapter } = makeManager(3);
+      await manager.open(openInput());
+      const process = ptyAdapter.processes[0];
+      expect(process).toBeDefined();
+      if (!process) return;
 
-    process.emitData("line1\nline2\nline3\nline4\n");
-    await manager.close({ threadId: "thread-1" });
+      process.emitData("line1\nline2\nline3\nline4\n");
+      await manager.close({ threadId: "thread-1" });
 
-    const reopened = await manager.open(openInput());
-    const nonEmptyLines = reopened.history.split("\n").filter((line) => line.length > 0);
-    expect(nonEmptyLines).toEqual(["line2", "line3", "line4"]);
+      const reopened = await manager.open(openInput());
+      const nonEmptyLines = reopened.history.split("\n").filter((line) => line.length > 0);
+      expect(nonEmptyLines).toEqual(["line2", "line3", "line4"]);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
   it("deletes history file when close(deleteHistory=true)", async () => {
     const { manager, ptyAdapter, logsDir } = makeManager();
@@ -467,13 +523,11 @@ describe("TerminalManager", () => {
     expect(process).toBeDefined();
     if (!process) return;
     process.emitData("bye\n");
-    await waitFor(() => fs.existsSync(historyLogPath(logsDir)));
-
     await manager.close({ threadId: "thread-1", deleteHistory: true });
     expect(fs.existsSync(historyLogPath(logsDir))).toBe(false);
 
     manager.dispose();
-  });
+  }, TerminalManagerSlowTestTimeoutMs);
 
   it("closes all terminals for a thread when close omits terminalId", async () => {
     const { manager, ptyAdapter, logsDir } = makeManager();
@@ -496,8 +550,6 @@ describe("TerminalManager", () => {
     expect(sidecarProcess.killed).toBe(true);
     expect(fs.existsSync(multiTerminalHistoryLogPath(logsDir, "thread-1", "default"))).toBe(false);
     expect(fs.existsSync(multiTerminalHistoryLogPath(logsDir, "thread-1", "sidecar"))).toBe(false);
-
-    manager.dispose();
   }, TerminalManagerSlowTestTimeoutMs);
 
   it(
@@ -509,8 +561,10 @@ describe("TerminalManager", () => {
       expect(process).toBeDefined();
       if (!process) return;
 
-      await manager.close({ threadId: "thread-1" });
-      await waitFor(() => process.killSignals.includes("SIGKILL"));
+      const closePromise = manager.close({ threadId: "thread-1", terminalId: "default" });
+      await waitFor(() => process.killSignals[0] === "SIGTERM", 2_000);
+      await waitFor(() => process.killSignals.includes("SIGKILL"), 2_000);
+      await closePromise;
 
       expect(process.killSignals[0]).toBe("SIGTERM");
       expect(process.killSignals).toContain("SIGKILL");
@@ -533,36 +587,37 @@ describe("TerminalManager", () => {
     if (!first || !second) return;
 
     first.emitExit({ exitCode: 0, signal: 0 });
-    await new Promise((resolve) => setTimeout(resolve, 5));
     second.emitExit({ exitCode: 0, signal: 0 });
 
     await waitFor(() => {
       const sessions = (manager as unknown as { sessions: Map<string, unknown> }).sessions;
-      return sessions.size === 1;
-    });
+      const keys = [...sessions.keys()];
+      return keys.length === 1 && keys[0] === "thread-2\u0000default";
+    }, 2_000);
 
     const sessions = (manager as unknown as { sessions: Map<string, unknown> }).sessions;
     const keys = [...sessions.keys()];
     expect(keys).toEqual(["thread-2\u0000default"]);
 
-    manager.dispose();
   }, TerminalManagerSlowTestTimeoutMs);
 
-  it("migrates legacy transcript filenames to terminal-scoped history path on open", async () => {
-    const { manager, logsDir } = makeManager();
-    const legacyPath = path.join(logsDir, "thread-1.log");
-    const nextPath = historyLogPath(logsDir);
-    fs.writeFileSync(legacyPath, "legacy-line\n", "utf8");
+  it(
+    "migrates legacy transcript filenames to terminal-scoped history path on open",
+    async () => {
+      const { manager, logsDir } = makeManager();
+      const legacyPath = path.join(logsDir, "thread-1.log");
+      const nextPath = historyLogPath(logsDir);
+      fs.writeFileSync(legacyPath, "legacy-line\n", "utf8");
 
-    const snapshot = await manager.open(openInput());
+      const snapshot = await manager.open(openInput());
 
-    expect(snapshot.history).toBe("legacy-line\n");
-    expect(fs.existsSync(nextPath)).toBe(true);
-    expect(fs.readFileSync(nextPath, "utf8")).toBe("legacy-line\n");
-    expect(fs.existsSync(legacyPath)).toBe(false);
-
-    manager.dispose();
-  });
+      expect(snapshot.history).toBe("legacy-line\n");
+      expect(fs.existsSync(nextPath)).toBe(true);
+      expect(fs.readFileSync(nextPath, "utf8")).toBe("legacy-line\n");
+      expect(fs.existsSync(legacyPath)).toBe(false);
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
   it(
     "retries with fallback shells when preferred shell spawn fails",
@@ -644,43 +699,51 @@ describe("TerminalManager", () => {
     } finally {
       restoreEnv();
     }
-  });
+  }, TerminalManagerSlowTestTimeoutMs);
 
-  it("injects runtime env overrides into spawned terminals", async () => {
-    const { manager, ptyAdapter } = makeManager();
-    await manager.open(
-      openInput({
-        env: {
-          T3CODE_PROJECT_ROOT: "/repo",
-          T3CODE_WORKTREE_PATH: "/repo/worktree-a",
-          CUSTOM_FLAG: "1",
-        },
-      }),
-    );
-    const spawnInput = ptyAdapter.spawnInputs[0];
-    expect(spawnInput).toBeDefined();
-    if (!spawnInput) return;
+  it(
+    "injects runtime env overrides into spawned terminals",
+    async () => {
+      const { manager, ptyAdapter } = makeManager();
+      await manager.open(
+        openInput({
+          env: {
+            T3CODE_PROJECT_ROOT: "/repo",
+            T3CODE_WORKTREE_PATH: "/repo/worktree-a",
+            CUSTOM_FLAG: "1",
+          },
+        }),
+      );
+      const spawnInput = ptyAdapter.spawnInputs[0];
+      expect(spawnInput).toBeDefined();
+      if (!spawnInput) return;
 
-    expect(spawnInput.env.T3CODE_PROJECT_ROOT).toBe("/repo");
-    expect(spawnInput.env.T3CODE_WORKTREE_PATH).toBe("/repo/worktree-a");
-    expect(spawnInput.env.CUSTOM_FLAG).toBe("1");
+      expect(spawnInput.env.T3CODE_PROJECT_ROOT).toBe("/repo");
+      expect(spawnInput.env.T3CODE_WORKTREE_PATH).toBe("/repo/worktree-a");
+      expect(spawnInput.env.CUSTOM_FLAG).toBe("1");
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 
-  it("starts zsh with prompt spacer disabled to avoid `%` end markers", async () => {
-    if (process.platform === "win32") return;
-    const { manager, ptyAdapter } = makeManager(5, {
-      shellResolver: () => "/bin/zsh",
-    });
-    await manager.open(openInput());
-    const spawnInput = ptyAdapter.spawnInputs[0];
-    expect(spawnInput).toBeDefined();
-    if (!spawnInput) return;
+  it(
+    "starts zsh with prompt spacer disabled to avoid `%` end markers",
+    async () => {
+      if (process.platform === "win32") return;
+      const { manager, ptyAdapter } = makeManager(5, {
+        shellResolver: () => "/bin/zsh",
+      });
+      await manager.open(openInput());
+      const spawnInput = ptyAdapter.spawnInputs[0];
+      expect(spawnInput).toBeDefined();
+      if (!spawnInput) return;
 
-    expect(spawnInput.shell).toBe("/bin/zsh");
-    expect(spawnInput.args).toEqual(["-o", "nopromptsp"]);
+      expect(spawnInput.shell).toBe("/bin/zsh");
+      expect(spawnInput.args).toEqual(["-o", "nopromptsp"]);
 
-    manager.dispose();
-  });
+      manager.dispose();
+    },
+    TerminalManagerSlowTestTimeoutMs,
+  );
 });

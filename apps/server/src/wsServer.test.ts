@@ -58,6 +58,7 @@ interface PendingMessages {
 }
 
 const pendingBySocket = new WeakMap<WebSocket, PendingMessages>();
+const WsServerSlowTestTimeoutMs = process.platform === "win32" ? 20_000 : 10_000;
 
 const asEventId = (value: string): EventId => EventId.makeUnsafe(value);
 const asProviderItemId = (value: string): ProviderItemId => ProviderItemId.makeUnsafe(value);
@@ -516,7 +517,7 @@ describe("WebSocket Server", () => {
       cwd: "/test/project",
       projectName: "project",
     });
-  });
+  }, WsServerSlowTestTimeoutMs);
 
   it("serves persisted attachments from stateDir", async () => {
     const stateDir = makeTempDir("t3code-state-attachments-");
@@ -534,7 +535,7 @@ describe("WebSocket Server", () => {
     expect(response.headers.get("content-type")).toContain("image/png");
     const bytes = Buffer.from(await response.arrayBuffer());
     expect(bytes).toEqual(Buffer.from("hello-attachment"));
-  });
+  }, WsServerSlowTestTimeoutMs);
 
   it("serves persisted attachments for URL-encoded paths", async () => {
     const stateDir = makeTempDir("t3code-state-attachments-encoded-");

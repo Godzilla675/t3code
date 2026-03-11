@@ -23,7 +23,10 @@ function makeFakeCodexBinary(dir: string) {
     const runnerPath = path.join(binDir, "fake-codex.cjs");
     const posixCodexPath = path.join(binDir, "codex");
     const windowsCodexPath = path.join(binDir, "codex.cmd");
+    const windowsCodexPs1Path = path.join(binDir, "codex.ps1");
+    const bundledCodexJsPath = path.join(binDir, "node_modules", "@openai", "codex", "bin", "codex.js");
     yield* fs.makeDirectory(binDir, { recursive: true });
+    yield* fs.makeDirectory(path.dirname(bundledCodexJsPath), { recursive: true });
 
     yield* fs.writeFileString(
       runnerPath,
@@ -90,6 +93,24 @@ function makeFakeCodexBinary(dir: string) {
     yield* fs.writeFileString(
       windowsCodexPath,
       ['@echo off', 'node "%~dp0fake-codex.cjs" %*', ""].join("\r\n"),
+    );
+    yield* fs.writeFileString(
+      windowsCodexPs1Path,
+      [
+        "param([Parameter(ValueFromRemainingArguments = $true)][string[]] $RemainingArgs)",
+        '$stdinContent = [Console]::In.ReadToEnd()',
+        'if ($stdinContent.Length -gt 0) {',
+        '  $stdinContent | & node "$PSScriptRoot/fake-codex.cjs" @RemainingArgs',
+        "} else {",
+        '  & node "$PSScriptRoot/fake-codex.cjs" @RemainingArgs',
+        "}",
+        "exit $LASTEXITCODE",
+        "",
+      ].join("\n"),
+    );
+    yield* fs.writeFileString(
+      bundledCodexJsPath,
+      ['require("../../../../fake-codex.cjs");', ""].join("\n"),
     );
     if (process.platform !== "win32") {
       yield* fs.chmod(posixCodexPath, 0o755);

@@ -43,6 +43,21 @@ function mockSpawnerLayer(
   );
 }
 
+function normalizeCodexArgs(args: ReadonlyArray<string>): ReadonlyArray<string> {
+  const firstArg = args[0]?.replaceAll("/", "\\").toLowerCase();
+  if (firstArg?.includes("\\node_modules\\@openai\\codex\\bin\\codex.js")) {
+    return args.slice(1);
+  }
+
+  const fileFlagIndex = args.findIndex((arg) => arg.toLowerCase() === "-file");
+  if (fileFlagIndex < 0) {
+    return args;
+  }
+
+  const codexArgsStart = fileFlagIndex + 2;
+  return codexArgsStart < args.length ? args.slice(codexArgsStart) : [];
+}
+
 function failingSpawnerLayer(description: string) {
   return Layer.succeed(
     ChildProcessSpawner.ChildProcessSpawner,
@@ -73,7 +88,7 @@ it.effect("returns ready when codex is installed and authenticated", () =>
       Layer.merge(
         NodeServices.layer,
         mockSpawnerLayer((args) => {
-          const joined = args.join(" ");
+          const joined = normalizeCodexArgs(args).join(" ");
           if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
           if (joined === "login status") return { stdout: "Logged in\n", stderr: "", code: 0 };
           throw new Error(`Unexpected args: ${joined}`);
@@ -110,7 +125,7 @@ it.effect("returns unavailable when codex is below the minimum supported version
       Layer.merge(
         NodeServices.layer,
         mockSpawnerLayer((args) => {
-          const joined = args.join(" ");
+          const joined = normalizeCodexArgs(args).join(" ");
           if (joined === "--version") return { stdout: "codex 0.36.0\n", stderr: "", code: 0 };
           throw new Error(`Unexpected args: ${joined}`);
         }),
@@ -135,7 +150,7 @@ it.effect("returns unauthenticated when auth probe reports login required", () =
       Layer.merge(
         NodeServices.layer,
         mockSpawnerLayer((args) => {
-          const joined = args.join(" ");
+          const joined = normalizeCodexArgs(args).join(" ");
           if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
           if (joined === "login status") {
             return { stdout: "", stderr: "Not logged in. Run codex login.", code: 1 };
@@ -165,7 +180,7 @@ it.effect(
         Layer.merge(
           NodeServices.layer,
           mockSpawnerLayer((args) => {
-            const joined = args.join(" ");
+            const joined = normalizeCodexArgs(args).join(" ");
             if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
             if (joined === "login status")
               return { stdout: "Not logged in\n", stderr: "", code: 1 };
@@ -192,7 +207,7 @@ it.effect("returns warning when login status command is unsupported", () =>
       Layer.merge(
         NodeServices.layer,
         mockSpawnerLayer((args) => {
-          const joined = args.join(" ");
+          const joined = normalizeCodexArgs(args).join(" ");
           if (joined === "--version") return { stdout: "codex 1.0.0\n", stderr: "", code: 0 };
           if (joined === "login status") {
             return { stdout: "", stderr: "error: unknown command 'login'", code: 2 };
@@ -292,6 +307,41 @@ it.effect("returns unavailable when Copilot client fails to start", () =>
       status.message,
       "GitHub Copilot is unavailable. Install or repair the Copilot CLI backend and restart T3 Code.",
     );
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reuses cached Copilot models when listing live models fails", () =>
+  Effect.gen(function* () {
+    const status = yield* checkCopilotProviderStatus({
+      clientFactory: () => ({
+        start: async () => undefined,
+        stop: async () => [],
+        getAuthStatus: async () => ({ authenticated: true }),
+        listModels: async () => {
+          throw new Error("model listing timed out");
+        },
+      }),
+      readCachedModels: async () => [
+        {
+          slug: "gpt-5.4",
+          name: "GPT-5.4",
+          supportedReasoningEfforts: ["high", "medium", "low"],
+          defaultReasoningEffort: "medium",
+        },
+      ],
+    });
+    assert.strictEqual(status.provider, "copilot");
+    assert.strictEqual(status.status, "ready");
+    assert.strictEqual(status.available, true);
+    assert.strictEqual(status.authStatus, "authenticated");
+    assert.deepStrictEqual(status.availableModels, [
+      {
+        slug: "gpt-5.4",
+        name: "GPT-5.4",
+        supportedReasoningEfforts: ["high", "medium", "low"],
+        defaultReasoningEffort: "medium",
+      },
+    ]);
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 

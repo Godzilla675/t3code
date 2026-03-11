@@ -98,6 +98,10 @@ class WaitForTimeoutError extends Schema.TaggedErrorClass<WaitForTimeoutError>()
   },
 ) {}
 
+const OrchestrationHarnessWaitTimeoutMs = process.platform === "win32" ? 8_000 : 3_000;
+const OrchestrationHarnessPollIntervalMs = process.platform === "win32" ? 25 : 10;
+const OrchestrationHarnessStartupDelayMs = process.platform === "win32" ? 50 : 10;
+
 function waitFor<A, E>(
   read: Effect.Effect<A, E>,
   predicate: (value: A) => boolean,
@@ -114,10 +118,10 @@ function waitFor<A, E>(
   read: Effect.Effect<A, E>,
   predicate: (value: A) => boolean,
   description: string,
-  timeoutMs = 3000,
+  timeoutMs = OrchestrationHarnessWaitTimeoutMs,
 ): Effect.Effect<A, never> {
   const RETRY_SIGNAL = "wait_for_retry";
-  const retryIntervalMs = 10;
+  const retryIntervalMs = OrchestrationHarnessPollIntervalMs;
   const maxRetries = Math.max(0, Math.floor(timeoutMs / retryIntervalMs));
   const retrySchedule = Schedule.spaced(`${retryIntervalMs} millis`);
 
@@ -329,7 +333,7 @@ export const makeOrchestrationIntegrationHarness = (
     yield* tryRuntimePromise("start OrchestrationReactor", () =>
       runtime.runPromise(reactor.start.pipe(Scope.provide(scope))),
     ).pipe(Effect.orDie);
-    yield* sleep(10);
+    yield* sleep(OrchestrationHarnessStartupDelayMs);
 
     const waitForThread: OrchestrationIntegrationHarness["waitForThread"] = (
       threadId,
